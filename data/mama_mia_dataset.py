@@ -330,6 +330,15 @@ class PreprocessedDataset(Dataset):
 # 3. DATASET BUILDERS
 # ─────────────────────────────────────────────
 
+def _seed_worker(worker_id):
+    """DataLoader worker_init_fn for reproducibility. Seeds numpy + python random
+    in each worker from the torch seed PyTorch already derived for that worker."""
+    import random as _random
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    _random.seed(worker_seed)
+
+
 def build_centralized_loaders(
     data_root: str = DATA_ROOT,
     split_csv: str = None,
@@ -340,6 +349,7 @@ def build_centralized_loaders(
     persistent_cache_dir: str = "",
     preprocessed_cache_dir: str = "",
     patch_size=None,
+    seed: int = None,
 ):
     """
     Returns (train_loader, val_loader) using all collections combined.
@@ -402,12 +412,18 @@ def build_centralized_loaders(
                 num_workers=num_workers,
             )
 
+    loader_kwargs = dict(collate_fn=_safe_collate, pin_memory=True,
+                         persistent_workers=num_workers > 0)
+    if seed is not None:
+        gen = torch.Generator()
+        gen.manual_seed(seed)
+        loader_kwargs["worker_init_fn"] = _seed_worker
+        loader_kwargs["generator"] = gen
+
     train_loader = MonaiLoader(train_ds, batch_size=batch_size, shuffle=True,
-                               num_workers=num_workers, collate_fn=_safe_collate,
-                               pin_memory=True, persistent_workers=num_workers > 0)
+                               num_workers=num_workers, **loader_kwargs)
     val_loader   = MonaiLoader(val_ds,   batch_size=1,          shuffle=False,
-                               num_workers=num_workers, collate_fn=_safe_collate,
-                               pin_memory=True, persistent_workers=num_workers > 0)
+                               num_workers=num_workers, **loader_kwargs)
 
     return train_loader, val_loader
 

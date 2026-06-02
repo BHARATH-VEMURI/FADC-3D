@@ -2,6 +2,7 @@ import os
 import sys
 import time
 import json
+import random
 import argparse
 import yaml
 import numpy as np
@@ -57,6 +58,9 @@ def parse_args():
                         help="Override patch size, e.g. --patch_size 96 96 48")
     parser.add_argument("--warmup_epochs", type=int, default=5,
                         help="Linear LR warmup epochs (0 to disable)")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Random seed for reproducibility. If set, enables "
+                             "cudnn.deterministic=True and seeds torch/numpy/random + DataLoader workers.")
     return parser.parse_args()
 
 
@@ -131,6 +135,18 @@ def validate(model, val_loader, dice_metric, post_pred, post_label, patch_size, 
 # ─────────────────────────────────────────────
 
 def train(cfg, args):
+    # Apply reproducibility seeding BEFORE building model / loaders / optimizer.
+    if args.seed is not None:
+        torch.manual_seed(args.seed)
+        torch.cuda.manual_seed_all(args.seed)
+        np.random.seed(args.seed)
+        random.seed(args.seed)
+        os.environ["PYTHONHASHSEED"] = str(args.seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        print(f"[seed] Seeded torch/numpy/random/cudnn with seed={args.seed} "
+              f"(cudnn.deterministic=True, benchmark=False)")
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
@@ -168,6 +184,7 @@ def train(cfg, args):
         persistent_cache_dir=args.persistent_cache_dir or "",
         preprocessed_cache_dir=args.preprocessed_cache_dir or "",
         patch_size=patch_size,
+        seed=args.seed,
     )
 
     # ── Model ─────────────────────────────────
@@ -355,6 +372,11 @@ def train(cfg, args):
     # ── Save training log ─────────────────────
     with open(output_dir / "train_log.json", "w") as f:
         json.dump(train_log, f, indent=2)
+
+    # Stamp seed + model in a separate meta.json (keeps train_log.json shape stable).
+    with open(output_dir / "meta.json", "w") as f:
+        json.dump({"seed": args.seed, "model": args.model,
+                   "best_dice": best_dice, "epochs": epochs}, f, indent=2)
 
     print(f"\nTraining complete. Best Val Dice: {best_dice:.4f}")
     print(f"Outputs saved to: {output_dir}")
