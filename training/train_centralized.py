@@ -11,6 +11,7 @@ from tqdm import tqdm
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.amp import GradScaler, autocast
 
 from monai.metrics import DiceMetric
@@ -61,7 +62,34 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=None,
                         help="Random seed for reproducibility. If set, enables "
                              "cudnn.deterministic=True and seeds torch/numpy/random + DataLoader workers.")
+    parser.add_argument("--deep_supervision", action="store_true",
+                        help="Enable nnU-Net style deep supervision (aux heads at dec2/dec3/dec4). "
+                             "Only the main head is used at inference.")
     return parser.parse_args()
+
+
+# nnU-Net deep-supervision weights at (main, dec2, dec3, dec4), normalized to sum to 1.
+_DS_WEIGHTS = [1.0, 0.5, 0.25, 0.125]
+_DS_WEIGHTS = [w / sum(_DS_WEIGHTS) for w in _DS_WEIGHTS]
+_DS_SCALES  = [1.0, 0.5, 0.25, 0.125]  # spatial scale of each head relative to main
+
+
+def deep_supervision_loss(preds_tuple, label, criterion):
+    """Weighted Dice+CE across DS scales. Returns (total, main_dice, main_ce)."""
+    total = 0.0
+    main_dice = None
+    main_ce   = None
+    for i, (p, w, s) in enumerate(zip(preds_tuple, _DS_WEIGHTS, _DS_SCALES)):
+        if s == 1.0:
+            lbl = label
+        else:
+            lbl = F.interpolate(label.float(), scale_factor=s, mode="nearest").to(label.dtype)
+        sub_total, sub_dice, sub_ce = criterion(p, lbl)
+        total = total + w * sub_total
+        if i == 0:
+            main_dice = sub_dice
+            main_ce   = sub_ce
+    return total, main_dice, main_ce
 
 
 # ─────────────────────────────────────────────
@@ -78,6 +106,10 @@ def load_config(config_path: str, args) -> dict:
     if args.cache_rate  is not None: cfg["data"]["cache_rate"]      = args.cache_rate
     if args.num_workers is not None: cfg["data"]["num_workers"]     = args.num_workers
     if args.patch_size  is not None: cfg["data"]["patch_size"]      = args.patch_size
+
+    # Stamp DS flag into cfg so it's saved with the checkpoint and the viz cell
+    # knows whether to instantiate the model with aux heads.
+    cfg["model"]["deep_supervision"] = bool(args.deep_supervision)
 
     return cfg
 
@@ -193,23 +225,28 @@ def train(cfg, args):
         out_channels=cfg["model"]["out_channels"],
         base_filters=cfg["model"]["base_filters"],
     )
+    fadc_kwargs = dict(deep_supervision=args.deep_supervision)
     if args.model == "unet3d_fadc":
-        model = UNet3DFADC(**model_kwargs, fadc_placement='full').to(device)
+        model = UNet3DFADC(**model_kwargs, fadc_placement='full', **fadc_kwargs).to(device)
     elif args.model == "unet3d_fadc_encoder":
-        model = UNet3DFADC(**model_kwargs, fadc_placement='encoder').to(device)
+        model = UNet3DFADC(**model_kwargs, fadc_placement='encoder', **fadc_kwargs).to(device)
     elif args.model == "unet3d_fadc_bottleneck":
-        model = UNet3DFADC(**model_kwargs, fadc_placement='bottleneck').to(device)
+        model = UNet3DFADC(**model_kwargs, fadc_placement='bottleneck', **fadc_kwargs).to(device)
     elif args.model == "unet3d_fadc_mid":
-        model = UNet3DFADC(**model_kwargs, fadc_placement='mid').to(device)
+        model = UNet3DFADC(**model_kwargs, fadc_placement='mid', **fadc_kwargs).to(device)
     elif args.model == "unet3d_fadc_deep":
-        model = UNet3DFADC(**model_kwargs, fadc_placement='deep').to(device)
+        model = UNet3DFADC(**model_kwargs, fadc_placement='deep', **fadc_kwargs).to(device)
     elif args.model == "unet3d_fadc_deep_lite":
-        model = UNet3DFADC(**model_kwargs, fadc_placement='deep_lite').to(device)
+        model = UNet3DFADC(**model_kwargs, fadc_placement='deep_lite', **fadc_kwargs).to(device)
     else:
+        if args.deep_supervision:
+            raise ValueError("--deep_supervision is only wired for FADC variants. "
+                             "Add DS heads to UNet3D first if you want it on the baseline.")
         model = UNet3D(**model_kwargs).to(device)
 
     total_params = sum(p.numel() for p in model.parameters())
-    print(f"Model: {args.model} | Parameters: {total_params:,}")
+    print(f"Model: {args.model} | Parameters: {total_params:,}"
+          f"{' | DEEP SUPERVISION ON (aux heads at dec2/dec3/dec4)' if args.deep_supervision else ''}")
 
     # ── Loss, Optimizer, Scheduler ────────────
     criterion = DiceCELoss(
@@ -284,7 +321,10 @@ def train(cfg, args):
 
             with autocast("cuda", enabled=device.type == "cuda"):
                 preds = model(images)
-                total_loss, dice_loss, ce_loss = criterion(preds, labels)
+                if isinstance(preds, tuple):
+                    total_loss, dice_loss, ce_loss = deep_supervision_loss(preds, labels, criterion)
+                else:
+                    total_loss, dice_loss, ce_loss = criterion(preds, labels)
 
             scaler.scale(total_loss).backward()
             scaler.unscale_(optimizer)

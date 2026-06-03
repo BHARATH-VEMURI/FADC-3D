@@ -103,7 +103,7 @@ class UNet3DFADC(nn.Module):
     only the conv block type changes, making this a clean ablation.
     """
     def __init__(self, in_channels=1, out_channels=2, base_filters=32,
-                 fadc_placement='full'):
+                 fadc_placement='full', deep_supervision=False):
         super().__init__()
         assert fadc_placement in ('full', 'encoder', 'bottleneck', 'mid', 'deep', 'deep_lite'), \
             f"fadc_placement must be 'full', 'encoder', 'bottleneck', 'mid', 'deep', or 'deep_lite', got '{fadc_placement}'"
@@ -112,6 +112,7 @@ class UNet3DFADC(nn.Module):
         bn_fadc  = fadc_placement in ('full', 'bottleneck', 'deep', 'deep_lite')
         dec_fadc = fadc_placement in ('full',)
 
+        self.deep_supervision = deep_supervision
         f = base_filters
 
         if fadc_placement == 'mid':
@@ -144,6 +145,14 @@ class UNet3DFADC(nn.Module):
 
         self.head = nn.Conv3d(f, out_channels, kernel_size=1)
 
+        # Deep-supervision aux heads (nnU-Net style): 1x1x1 conv at dec2, dec3, dec4.
+        # Only used when deep_supervision=True AND self.training=True; at eval the
+        # model returns the main head only so MONAI's sliding-window inference works.
+        if deep_supervision:
+            self.ds_head2 = nn.Conv3d(f * 2, out_channels, kernel_size=1)
+            self.ds_head3 = nn.Conv3d(f * 4, out_channels, kernel_size=1)
+            self.ds_head4 = nn.Conv3d(f * 8, out_channels, kernel_size=1)
+
     def forward(self, x):
         x, s1 = self.enc1(x)
         x, s2 = self.enc2(x)
@@ -152,12 +161,15 @@ class UNet3DFADC(nn.Module):
 
         x = self.bottleneck(x)
 
-        x = self.dec4(x, s4)
-        x = self.dec3(x, s3)
-        x = self.dec2(x, s2)
-        x = self.dec1(x, s1)
+        d4 = self.dec4(x,  s4)
+        d3 = self.dec3(d4, s3)
+        d2 = self.dec2(d3, s2)
+        d1 = self.dec1(d2, s1)
 
-        return self.head(x)
+        main = self.head(d1)
+        if self.deep_supervision and self.training:
+            return main, self.ds_head2(d2), self.ds_head3(d3), self.ds_head4(d4)
+        return main
 
 
 if __name__ == '__main__':
