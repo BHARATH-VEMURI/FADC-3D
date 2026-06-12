@@ -25,9 +25,16 @@ kaggle.json
 .env
 *.log
 
-# Local-only documents
+# Local-only documents (paper drafts, working notes, planning)
 PROJECT_REPORT.txt
 PAPER_DRAFT_IEEE.txt
+LITERATURE_SURVEY.txt
+PAPER_WRITING_CHECKLIST.txt
+NEXT_STEPS.txt
+CODE_WALKTHROUGH.txt
+
+# Training outputs (checkpoints, logs, generated artifacts)
+outputs/
 
 # OS
 .DS_Store
