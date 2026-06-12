@@ -1,0 +1,20 @@
+model:
+  in_channels: 4        # 4 channels: pre (_0000), post1 (_0001), post2 (_0002), subtraction (post1 - pre)
+  out_channels: 2       # background + tumor
+  base_filters: 32      # same as 2ch baseline for apples-to-apples comparison
+
+data:
+  patch_size: [128, 128, 64]
+  cache_rate: 0.0             # 0.0 for CPU/local, 1.0 on Kaggle GPU
+  num_workers: 2              # 0 on Windows if multiprocessing errors occur
+  preprocessed_cache_dir: ""  # set to Kaggle 4ch cache path in the notebook
+  phase_aug: true             # random permutation of channels [1,2,3] during training
+  p_phase_aug: 0.5            # probability of applying phase aug per sample
+
+training:
+  epochs: 100
+  batch_size: 2
+  lr: 1.0e-4
+  dice_weight: 0.5
+  ce_weight: 0.5
+  val_every: 25         # run validation every N epochs
