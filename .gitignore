@@ -32,6 +32,8 @@ LITERATURE_SURVEY.txt
 PAPER_WRITING_CHECKLIST.txt
 NEXT_STEPS.txt
 CODE_WALKTHROUGH.txt
+GUIDE_MEETING_*.txt
+FADC_V2_NOTES.txt
 
 # Training outputs (checkpoints, logs, generated artifacts)
 outputs/
