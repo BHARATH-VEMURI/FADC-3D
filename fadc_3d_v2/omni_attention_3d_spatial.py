@@ -128,18 +128,22 @@ class OmniAttention3DSpatial(nn.Module):
 
     def get_channel_attention(self, x_pooled):
         # x_pooled: (b, attention_channel, 1, 1, 1)
+        # NOTE: temperature is a softmax concept and belongs to k_att only.
+        # Applying it to a sigmoid squashes the bias signal back toward 0.5,
+        # which neutralized the v2 warm-init (bias=0.5 at T=4.0 -> sigmoid(0.125)=0.531).
+        # Sigmoid has no temperature term here.
         return torch.sigmoid(self.channel_fc(x_pooled).view(
-            x_pooled.size(0), -1, 1, 1, 1) / self.temperature)
+            x_pooled.size(0), -1, 1, 1, 1))
 
     def get_filter_attention(self, x_pooled):
         return torch.sigmoid(self.filter_fc(x_pooled).view(
-            x_pooled.size(0), -1, 1, 1, 1) / self.temperature)
+            x_pooled.size(0), -1, 1, 1, 1))
 
     def get_spatial_attention(self, x_pooled):
         k = self.kernel_size
         spatial_attention = self.spatial_fc(x_pooled).view(
             x_pooled.size(0), 1, 1, 1, 1, k, k, k)
-        return torch.sigmoid(spatial_attention / self.temperature)
+        return torch.sigmoid(spatial_attention)
 
     def get_kernel_attention_spatial(self, x_full):
         """v2 spatial k_att path. x_full: (b, in_planes, d, h, w).

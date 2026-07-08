@@ -408,12 +408,13 @@ def train(cfg, args):
             if val_dice > best_dice:
                 best_dice = val_dice
                 torch.save({
-                    "epoch":     epoch,
-                    "model":     model.state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                    "scheduler": scheduler.state_dict(),
-                    "best_dice": best_dice,
-                    "config":    cfg,
+                    "epoch":      epoch,
+                    "model":      model.state_dict(),
+                    "optimizer":  optimizer.state_dict(),
+                    "scheduler":  scheduler.state_dict(),
+                    "best_dice":  best_dice,
+                    "config":     cfg,
+                    "model_name": args.model,
                 }, output_dir / "best_model.pth")
                 print(f"  *** NEW BEST Dice {best_dice:.4f} -> {output_dir}/best_model.pth ***")
 
@@ -421,12 +422,13 @@ def train(cfg, args):
 
         if (epoch + 1) % 5 == 0:
             torch.save({
-                "epoch":     epoch,
-                "model":     model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "scheduler": scheduler.state_dict(),
-                "best_dice": best_dice,
-                "config":    cfg,
+                "epoch":      epoch,
+                "model":      model.state_dict(),
+                "optimizer":  optimizer.state_dict(),
+                "scheduler":  scheduler.state_dict(),
+                "best_dice":  best_dice,
+                "config":     cfg,
+                "model_name": args.model,
             }, output_dir / "latest_checkpoint.pth")
 
     with open(output_dir / "train_log.json", "w") as f:
