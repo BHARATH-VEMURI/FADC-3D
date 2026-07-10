@@ -65,6 +65,8 @@ def parse_args():
     parser.add_argument("--deep_supervision", action="store_true",
                         help="Enable nnU-Net style deep supervision (aux heads at dec2/dec3/dec4). "
                              "Only the main head is used at inference.")
+    parser.add_argument("--val_every", type=int, default=None,
+                        help="Override config.yaml training.val_every (validation cadence in epochs).")
     return parser.parse_args()
 
 
@@ -192,6 +194,9 @@ def train(cfg, args):
     cache_rate  = cfg["data"]["cache_rate"]
     num_workers = cfg["data"]["num_workers"]
     val_every   = cfg["training"]["val_every"]
+    if args.val_every is not None:
+        val_every = args.val_every
+        print(f"val_every overridden by CLI: {val_every}")
 
     # ── Data ──────────────────────────────────
     split_csv = os.path.join(args.data_root, "train_test_splits.csv")
@@ -383,12 +388,13 @@ def train(cfg, args):
             if val_dice > best_dice:
                 best_dice = val_dice
                 torch.save({
-                    "epoch":     epoch,
-                    "model":     model.state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                    "scheduler": scheduler.state_dict(),
-                    "best_dice": best_dice,
-                    "config":    cfg,
+                    "epoch":      epoch,
+                    "model":      model.state_dict(),
+                    "optimizer":  optimizer.state_dict(),
+                    "scheduler":  scheduler.state_dict(),
+                    "best_dice":  best_dice,
+                    "config":     cfg,
+                    "model_name": args.model,
                 }, output_dir / "best_model.pth")
                 print(f"  {'*' * 60}")
                 print(f"  *** NEW BEST  Epoch {epoch+1:03d} | "
@@ -401,12 +407,13 @@ def train(cfg, args):
         # Save latest checkpoint every 5 epochs for resuming
         if (epoch + 1) % 5 == 0:
             torch.save({
-                "epoch":     epoch,
-                "model":     model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "scheduler": scheduler.state_dict(),
-                "best_dice": best_dice,
-                "config":    cfg,
+                "epoch":      epoch,
+                "model":      model.state_dict(),
+                "optimizer":  optimizer.state_dict(),
+                "scheduler":  scheduler.state_dict(),
+                "best_dice":  best_dice,
+                "config":     cfg,
+                "model_name": args.model,
             }, output_dir / "latest_checkpoint.pth")
 
     # ── Save training log ─────────────────────

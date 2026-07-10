@@ -94,6 +94,8 @@ def parse_args():
                         help="Final softmax temperature for k_att (1.0=normal)")
     parser.add_argument("--k_att_anneal_epochs", type=int, default=None,
                         help="Anneal over this many epochs (default = total epochs).")
+    parser.add_argument("--val_every", type=int, default=None,
+                        help="Override config.yaml training.val_every (validation cadence in epochs).")
     return parser.parse_args()
 
 
@@ -239,6 +241,9 @@ def train(cfg, args):
     cache_rate  = cfg["data"]["cache_rate"]
     num_workers = cfg["data"]["num_workers"]
     val_every   = cfg["training"]["val_every"]
+    if args.val_every is not None:
+        val_every = args.val_every
+        print(f"val_every overridden by CLI: {val_every}")
 
     split_csv = os.path.join(args.data_root, "train_test_splits.csv")
     if not os.path.exists(split_csv):
