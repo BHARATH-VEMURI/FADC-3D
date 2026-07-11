@@ -90,8 +90,8 @@ def parse_args():
     # V2-specific
     parser.add_argument("--k_att_temp_start", type=float, default=4.0,
                         help="Initial softmax temperature for k_att (high=more mixing)")
-    parser.add_argument("--k_att_temp_end",   type=float, default=1.0,
-                        help="Final softmax temperature for k_att (1.0=normal)")
+    parser.add_argument("--k_att_temp_end",   type=float, default=0.8,
+                        help="Final softmax temperature for k_att (1.0=normal, <1.0=sharper)")
     parser.add_argument("--k_att_anneal_epochs", type=int, default=None,
                         help="Anneal over this many epochs (default = total epochs).")
     parser.add_argument("--val_every", type=int, default=None,
