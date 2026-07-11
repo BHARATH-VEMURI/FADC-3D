@@ -3,21 +3,37 @@
 Differences vs original OmniAttention3D (in fadc_3d/omni_attention_3d.py):
 
   1. SPATIAL k_att.
-       Original: global avg pool → 1x1x1 conv → softmax. Output shape
+       Original: global avg pool -> 1x1x1 conv -> softmax. Output shape
                  (b, kernel_num, 1, 1, 1) — one weight per whole input image.
-       v2:      Direct 3x3x3 conv on the full feature map → 1x1x1 conv → softmax.
+       v2:      Direct 3x3x3 conv on the full feature map -> 1x1x1 conv -> softmax.
                 Output shape (b, kernel_num, d, h, w) — one softmax per voxel.
 
   2. WARM bias init for channel_fc and filter_fc.
-       Original: bias=0 → sigmoid(0)*2 = 1.0 — exact identity, dead gradient.
-       v2:      bias=0.5 → sigmoid(0.5)*2 = 1.24 — starts slightly above identity
-                so gradients are non-trivial. This addresses the empirical
-                finding that c_att/f_att stayed stuck at ~0.5 in v1 trained checkpoints.
+       Original: bias=0 -> sigmoid(0)*2 = 1.0 — exact identity, dead gradient.
+       v2:      bias=0.5 -> sigmoid(0.5)*2 = 1.24 — starts slightly above identity
+                so gradients are non-trivial.
 
   3. TEMPERATURE annealing supported via set_temperature(t).
-       The training loop is expected to schedule self.temperature from a high
-       value (e.g. 4.0 — promotes mixing) down to 1.0 (sharper softmax) over
-       training epochs.
+       The training loop schedules self.temperature from a high value (e.g. 4.0)
+       down to 1.0 over training epochs. Applied only inside the k_att softmax.
+
+  4. RICHER pooled descriptor (v2.1 capacity bump).
+       Original: single AdaptiveAvgPool3d(1) -> shared FC.
+       v2.1:    Concatenate AdaptiveAvgPool3d(1) with AdaptiveMaxPool3d(1)
+                along the channel dim before the shared FC, so the c_att /
+                f_att / s_att paths see BOTH mean and peak statistics. The
+                shared FC takes 2*in_planes channels in.
+
+  5. WIDER attention bottleneck (v2.1 capacity bump).
+       Original: reduction=0.0625, min_channel=16 -> attention_channel often
+                 pinned at 16 for shallow layers.
+       v2.1:    reduction=0.125, min_channel=32 -> attention_channel is at
+                least 32 everywhere, and doubles for wide deep layers.
+
+  6. ALWAYS-ON filter attention (v2.1 correctness).
+       Original: skipped filter_fc when in_planes == groups == out_planes,
+                 returning the constant 1.0 for f_att.
+       v2.1:    filter_fc is always constructed; f_att is always computed.
 
 The interface (forward returns 4-tuple c_att, f_att, s_att, k_att) is preserved
 so AdaptiveDilatedConv3DV2 can be a drop-in for the original AdaptiveDilatedConv3D
@@ -29,19 +45,19 @@ import torch.nn.functional as F
 
 
 class OmniAttention3DSpatial(nn.Module):
-    """v2 attention — keeps channel/filter attention per-image (via avgpool),
-    but routes k_att through a dedicated spatial path.
+    """v2 attention — richer avg+max pooled descriptor for c_att / f_att / s_att,
+    dedicated spatial path for k_att.
 
     Args:
       in_planes, out_planes, kernel_size, groups, reduction, kernel_num, min_channel
         — same semantics as the original OmniAttention3D.
       k_att_kernel_size : kernel size of the spatial k_att conv head (default 3).
       bias_init         : initial bias for channel_fc and filter_fc (default 0.5).
-                          0.5 → sigmoid(0.5)*2 ≈ 1.24 (above identity).
+                          0.5 -> sigmoid(0.5)*2 ~ 1.24 (above identity).
     """
 
     def __init__(self, in_planes, out_planes, kernel_size,
-                 groups=1, reduction=0.0625, kernel_num=4, min_channel=16,
+                 groups=1, reduction=0.125, kernel_num=4, min_channel=32,
                  k_att_kernel_size=3, bias_init=0.5):
         super().__init__()
         attention_channel = max(int(in_planes * reduction), min_channel)
@@ -50,10 +66,12 @@ class OmniAttention3DSpatial(nn.Module):
         self.temperature = 1.0
         self.bias_init = bias_init
 
-        # ── shared pooled descriptor path (unchanged from v1) ──
+        # ── shared pooled descriptor path — avg + max concat (v2.1) ──
         # Used for c_att, f_att, s_att (NOT k_att in v2).
         self.avgpool = nn.AdaptiveAvgPool3d(1)
-        self.fc = nn.Conv3d(in_planes, attention_channel, 1, bias=False)
+        self.maxpool = nn.AdaptiveMaxPool3d(1)
+        # Concat doubles the channel dim before the FC.
+        self.fc = nn.Conv3d(in_planes * 2, attention_channel, 1, bias=False)
         self.gn = nn.GroupNorm(1, attention_channel)
         self.relu = nn.ReLU(inplace=True)
 
@@ -61,13 +79,9 @@ class OmniAttention3DSpatial(nn.Module):
         self.channel_fc = nn.Conv3d(attention_channel, in_planes, 1, bias=True)
         self.func_channel = self.get_channel_attention
 
-        # ── filter attention ──
-        if in_planes == groups and in_planes == out_planes:
-            self.func_filter = self.skip
-            self.filter_fc = None
-        else:
-            self.filter_fc = nn.Conv3d(attention_channel, out_planes, 1, bias=True)
-            self.func_filter = self.get_filter_attention
+        # ── filter attention — always on (v2.1) ──
+        self.filter_fc = nn.Conv3d(attention_channel, out_planes, 1, bias=True)
+        self.func_filter = self.get_filter_attention
 
         # ── spatial attention (still global-pooled — kernel_size=1 path uses skip) ──
         if kernel_size == 1:
@@ -108,11 +122,9 @@ class OmniAttention3DSpatial(nn.Module):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
 
-        # ── WARM bias for c_att / f_att (v2 fix) ──
-        if self.channel_fc is not None and self.channel_fc.bias is not None:
-            nn.init.constant_(self.channel_fc.bias, self.bias_init)
-        if self.filter_fc is not None and self.filter_fc.bias is not None:
-            nn.init.constant_(self.filter_fc.bias, self.bias_init)
+        # ── WARM bias for c_att / f_att (v2 fix, kept in v2.1) ──
+        nn.init.constant_(self.channel_fc.bias, self.bias_init)
+        nn.init.constant_(self.filter_fc.bias, self.bias_init)
 
     def set_temperature(self, t: float):
         """Set softmax temperature for kernel attention (called by training loop)."""
@@ -128,10 +140,7 @@ class OmniAttention3DSpatial(nn.Module):
 
     def get_channel_attention(self, x_pooled):
         # x_pooled: (b, attention_channel, 1, 1, 1)
-        # NOTE: temperature is a softmax concept and belongs to k_att only.
-        # Applying it to a sigmoid squashes the bias signal back toward 0.5,
-        # which neutralized the v2 warm-init (bias=0.5 at T=4.0 -> sigmoid(0.125)=0.531).
-        # Sigmoid has no temperature term here.
+        # Sigmoid has no temperature term — temperature belongs to k_att softmax only.
         return torch.sigmoid(self.channel_fc(x_pooled).view(
             x_pooled.size(0), -1, 1, 1, 1))
 
@@ -153,8 +162,10 @@ class OmniAttention3DSpatial(nn.Module):
         return F.softmax(logits / self.temperature, dim=1)
 
     def forward(self, x):
-        # Pooled descriptor for c_att / f_att / s_att
-        x_pooled = self.avgpool(x)
+        # Pooled descriptor for c_att / f_att / s_att — avg + max concat.
+        avg = self.avgpool(x)                       # (b, in_planes, 1, 1, 1)
+        mx  = self.maxpool(x)                       # (b, in_planes, 1, 1, 1)
+        x_pooled = torch.cat([avg, mx], dim=1)      # (b, 2*in_planes, 1, 1, 1)
         x_pooled = self.fc(x_pooled)
         x_pooled = self.gn(x_pooled)
         x_pooled = self.relu(x_pooled)

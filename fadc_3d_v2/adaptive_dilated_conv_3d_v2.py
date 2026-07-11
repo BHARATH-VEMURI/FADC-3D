@@ -42,8 +42,8 @@ class AdaptiveDilatedConv3DV2(nn.Module):
                  groups=1,
                  bias=True,
                  dilation_list=None,
-                 reduction=0.0625,
-                 min_channel=16,
+                 reduction=0.125,
+                 min_channel=32,
                  fs_cfg=None,
                  k_att_kernel_size=3,
                  bias_init=0.5):
