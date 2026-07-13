@@ -98,7 +98,7 @@ def parse_args():
     parser.add_argument("--k_att_anneal_epochs", type=int, default=None,
                         help="Anneal over this many epochs. If unset, defaults to "
                              "int(epochs * 0.6) on this branch so the anneal completes "
-                             "at ~60% of training and the final 40% trains at t_end.")
+                             "at ~60%% of training and the final 40%% trains at t_end.")
     parser.add_argument("--val_every", type=int, default=None,
                         help="Override config.yaml training.val_every (validation cadence in epochs).")
     # Attention diversity aux loss (new on this branch)
