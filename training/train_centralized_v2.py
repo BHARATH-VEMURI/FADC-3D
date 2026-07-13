@@ -93,10 +93,10 @@ def parse_args():
                         help="Initial softmax temperature for k_att (high=more mixing)")
     parser.add_argument("--k_att_temp_end",   type=float, default=0.5,
                         help="Final softmax temperature for k_att (1.0=normal, <1.0=sharper). "
-                             "Lowered from 0.8 on the attention-diversity branch so the "
-                             "spatial branch commits harder to per-voxel dilation choices.")
+                             "Default %(default)s (was 0.8 on v2.1). Lowered so the spatial "
+                             "branch commits harder to per-voxel dilation choices.")
     parser.add_argument("--k_att_anneal_epochs", type=int, default=None,
-                        help="Anneal over this many epochs. If unset, defaults to "
+                        help="Anneal over this many epochs. Default %(default)s means "
                              "int(epochs * 0.6) on this branch so the anneal completes "
                              "at ~60%% of training and the final 40%% trains at t_end.")
     parser.add_argument("--val_every", type=int, default=None,
