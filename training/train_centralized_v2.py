@@ -91,24 +91,34 @@ def parse_args():
     # V2-specific
     parser.add_argument("--k_att_temp_start", type=float, default=4.0,
                         help="Initial softmax temperature for k_att (high=more mixing)")
-    parser.add_argument("--k_att_temp_end",   type=float, default=0.5,
+    parser.add_argument("--k_att_temp_end",   type=float, default=0.8,
                         help="Final softmax temperature for k_att (1.0=normal, <1.0=sharper). "
-                             "Default %(default)s (was 0.8 on v2.1). Lowered so the spatial "
-                             "branch commits harder to per-voxel dilation choices.")
+                             "Default %(default)s. Reverted from the 0.5 endpoint after the "
+                             "0.5 + short anneal combination destabilized k_att adaptation at ep30.")
     parser.add_argument("--k_att_anneal_epochs", type=int, default=None,
                         help="Anneal over this many epochs. Default %(default)s means "
                              "int(epochs * 0.6) on this branch so the anneal completes "
                              "at ~60%% of training and the final 40%% trains at t_end.")
     parser.add_argument("--val_every", type=int, default=None,
                         help="Override config.yaml training.val_every (validation cadence in epochs).")
-    # Attention diversity aux loss (new on this branch)
-    parser.add_argument("--attn_diversity_weight", type=float, default=0.02,
+    # Attention diversity aux loss
+    parser.add_argument("--attn_diversity_weight", type=float, default=0.005,
                         help="Weight lambda for the c_att/f_att batch-diversity aux loss. "
+                             "Default %(default)s (was 0.02 before the ep30 collapse). "
                              "0.0 disables the aux loss entirely.")
     parser.add_argument("--attn_diversity_target", type=float, default=0.03,
                         help="Target batch-std for c_att/f_att. The aux loss is a hinge: "
                              "clamp(target - actual_std, min=0), so once std reaches target "
                              "there is no penalty. 0.03 is 30x the current dead-layer values.")
+    parser.add_argument("--attn_diversity_start_epoch", type=int, default=10,
+                        help="Epoch (0-indexed) at which to start applying the aux loss. "
+                             "Aux is disabled during warm-up before this epoch so seg loss "
+                             "can settle. Default %(default)s.")
+    parser.add_argument("--attn_diversity_layers", type=str, default="enc3,enc4",
+                        help="Comma-separated dotted-path prefixes for layers the aux loss "
+                             "should target. Empty string means ALL FADC layers (v2.1 "
+                             "behaviour). Default '%(default)s' — apply only to deep encoder "
+                             "layers where c_att/f_att collapse is most severe.")
     return parser.parse_args()
 
 
@@ -258,14 +268,37 @@ class _AttnStore:
         self.f_atts.clear()
 
 
-def register_attention_hooks(model):
+def _name_matches_prefixes(name: str, prefixes) -> bool:
+    """Return True if `name` equals or is a dotted-descendant of any prefix.
+    e.g. name='enc3.conv.conv1.omni_att', prefixes=['enc3','enc4'] -> True.
+    prefixes=None or [] treats every layer as a match (backwards compat)."""
+    if not prefixes:
+        return True
+    for p in prefixes:
+        p = p.strip()
+        if not p:
+            continue
+        if name == p or name.startswith(p + "."):
+            return True
+    return False
+
+
+def register_attention_hooks(model, layer_prefixes=None):
     """Register a forward hook on every OmniAttention3DSpatial that appends
     c_att / f_att to the store when store.enabled is True.
-    Returns (store, handles). Caller must handle detachment."""
+
+    If `layer_prefixes` is provided (list of dotted-path prefixes such as
+    ['enc3','enc4']), only modules whose dotted name matches one of those
+    prefixes get a hook. None / empty list = hook every FADC layer.
+
+    Returns (store, handles, hooked_names). Caller must remove handles."""
     store = _AttnStore()
     handles = []
-    for _name, mod in model.named_modules():
+    hooked_names = []
+    for name, mod in model.named_modules():
         if isinstance(mod, OmniAttention3DSpatial):
+            if not _name_matches_prefixes(name, layer_prefixes):
+                continue
             def _hook(_module, _inp, out, _store=store):
                 if not _store.enabled:
                     return
@@ -273,7 +306,8 @@ def register_attention_hooks(model):
                 _store.c_atts.append(c_att)
                 _store.f_atts.append(f_att)
             handles.append(mod.register_forward_hook(_hook))
-    return store, handles
+            hooked_names.append(name)
+    return store, handles, hooked_names
 
 
 def attention_diversity_loss(store, target_std: float, device):
@@ -412,17 +446,30 @@ def train(cfg, args):
           f"held at {args.k_att_temp_end} for the remaining {epochs - anneal_epochs} epochs")
 
     # Attention diversity aux loss setup.
-    attn_store, attn_hook_handles = register_attention_hooks(model)
-    aux_enabled = args.attn_diversity_weight > 0.0
-    if aux_enabled:
-        print(f"Attention diversity aux loss: lambda={args.attn_diversity_weight}, "
-              f"target_std={args.attn_diversity_target}")
+    # Parse comma-separated layer-prefix filter — empty string means all.
+    layer_prefixes = [p.strip() for p in args.attn_diversity_layers.split(",") if p.strip()]
+    attn_store, attn_hook_handles, hooked_names = register_attention_hooks(
+        model, layer_prefixes=layer_prefixes or None)
+    aux_configured = args.attn_diversity_weight > 0.0
+    if aux_configured:
+        if hooked_names:
+            layer_desc = (", ".join(layer_prefixes) if layer_prefixes else "all")
+            print(f"Attention diversity aux loss: lambda={args.attn_diversity_weight}, "
+                  f"target_std={args.attn_diversity_target}, "
+                  f"start_epoch={args.attn_diversity_start_epoch}, "
+                  f"layer_prefixes=[{layer_desc}] "
+                  f"({len(hooked_names)} layer(s) hooked: {hooked_names})")
+        else:
+            print(f"WARNING: layer_prefixes {layer_prefixes} matched 0 FADC layers. "
+                  f"Aux loss is configured but will always be 0.")
+            aux_configured = False
     else:
         print("Attention diversity aux loss: DISABLED (lambda=0)")
 
     print(f"\nStarting training: {epochs} epochs | LR {lr} | Batch {batch_size}")
     print("=" * 70)
 
+    aux_was_active_prev = False
     for epoch in range(start_epoch, epochs):
         # V2 — set k_att temperature for this epoch BEFORE training
         if hasattr(model, "set_temperature"):
@@ -431,6 +478,12 @@ def train(cfg, args):
             model.set_temperature(t)
         else:
             t = float("nan")
+
+        # Aux loss gating — only active from --attn_diversity_start_epoch onward.
+        aux_active_this_epoch = aux_configured and (epoch >= args.attn_diversity_start_epoch)
+        if aux_active_this_epoch and not aux_was_active_prev:
+            print(f"  --> Attention diversity aux loss ACTIVATED at epoch {epoch+1}")
+        aux_was_active_prev = aux_active_this_epoch
 
         model.train()
         epoch_loss  = 0.0
@@ -457,7 +510,7 @@ def train(cfg, args):
 
             optimizer.zero_grad()
             attn_store.clear()
-            attn_store.enabled = aux_enabled
+            attn_store.enabled = aux_active_this_epoch
             with autocast("cuda", enabled=device.type == "cuda"):
                 preds = model(images)
                 if isinstance(preds, tuple):
@@ -465,7 +518,7 @@ def train(cfg, args):
                 else:
                     total_loss, dice_loss, ce_loss = criterion(preds, labels)
 
-                if aux_enabled:
+                if aux_active_this_epoch:
                     aux_loss = attention_diversity_loss(
                         attn_store, args.attn_diversity_target, device)
                     total_loss = total_loss + args.attn_diversity_weight * aux_loss
@@ -559,6 +612,9 @@ def train(cfg, args):
             "k_att_anneal_epochs": anneal_epochs,
             "attn_diversity_weight": args.attn_diversity_weight,
             "attn_diversity_target": args.attn_diversity_target,
+            "attn_diversity_start_epoch": args.attn_diversity_start_epoch,
+            "attn_diversity_layers": args.attn_diversity_layers,
+            "attn_diversity_hooked_names": hooked_names,
             "best_dice": best_dice,
             "epochs": epochs,
         }, f, indent=2)
