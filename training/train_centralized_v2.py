@@ -43,6 +43,7 @@ sys.path.append(str(Path(__file__).parent.parent))
 from data.mama_mia_dataset import build_centralized_loaders, DATA_ROOT
 from models.unet_3d import UNet3D
 from models.unet_3d_fadc_v2 import UNet3DFADC_V2
+from fadc_3d_v2.omni_attention_3d_spatial import OmniAttention3DSpatial
 from training.losses import DiceCELoss
 
 
@@ -90,12 +91,24 @@ def parse_args():
     # V2-specific
     parser.add_argument("--k_att_temp_start", type=float, default=4.0,
                         help="Initial softmax temperature for k_att (high=more mixing)")
-    parser.add_argument("--k_att_temp_end",   type=float, default=0.8,
-                        help="Final softmax temperature for k_att (1.0=normal, <1.0=sharper)")
+    parser.add_argument("--k_att_temp_end",   type=float, default=0.5,
+                        help="Final softmax temperature for k_att (1.0=normal, <1.0=sharper). "
+                             "Lowered from 0.8 on the attention-diversity branch so the "
+                             "spatial branch commits harder to per-voxel dilation choices.")
     parser.add_argument("--k_att_anneal_epochs", type=int, default=None,
-                        help="Anneal over this many epochs (default = total epochs).")
+                        help="Anneal over this many epochs. If unset, defaults to "
+                             "int(epochs * 0.6) on this branch so the anneal completes "
+                             "at ~60% of training and the final 40% trains at t_end.")
     parser.add_argument("--val_every", type=int, default=None,
                         help="Override config.yaml training.val_every (validation cadence in epochs).")
+    # Attention diversity aux loss (new on this branch)
+    parser.add_argument("--attn_diversity_weight", type=float, default=0.02,
+                        help="Weight lambda for the c_att/f_att batch-diversity aux loss. "
+                             "0.0 disables the aux loss entirely.")
+    parser.add_argument("--attn_diversity_target", type=float, default=0.03,
+                        help="Target batch-std for c_att/f_att. The aux loss is a hinge: "
+                             "clamp(target - actual_std, min=0), so once std reaches target "
+                             "there is no penalty. 0.03 is 30x the current dead-layer values.")
     return parser.parse_args()
 
 
@@ -214,7 +227,74 @@ def build_model(args, model_kwargs, fadc_kwargs, device):
 
 
 # ─────────────────────────────────────────────
-# 5. TRAIN
+# 5. ATTENTION DIVERSITY AUX LOSS
+# ─────────────────────────────────────────────
+# Diagnostics on Encoder v2/v2.1 show c_att and f_att adaptation collapses
+# past enc1 (batch-std < 0.005 at every deeper layer, dropping to 0.0002 at
+# enc4.c2 by ep30). k_att is fine because its 3x3x3 spatial trunk bypasses
+# the GAP that starves c_att/f_att of per-input signal. This aux loss
+# rewards non-trivial batch variation in c_att/f_att directly, so gradients
+# flow into the channel_fc / filter_fc weights that would otherwise stay
+# near their warm-init and produce near-constant outputs.
+#
+# Formulation: hinge loss on batch-std per channel, averaged over layers.
+#   For each c_att / f_att tensor of shape (B, C, 1, 1, 1):
+#     std_per_ch = std over batch dim, shape (C, 1, 1, 1)
+#     mean_std   = mean over channels, scalar
+#     layer_loss = clamp(target - mean_std, min=0)
+#   Aux loss = mean over all layers of layer_loss.
+#   Total training loss = seg_loss + lambda * aux_loss.
+# Once mean_std reaches the target on a layer, that layer contributes 0.
+
+class _AttnStore:
+    """Per-batch collector for c_att / f_att tensors from every FADC layer."""
+    def __init__(self):
+        self.enabled = False
+        self.c_atts = []
+        self.f_atts = []
+
+    def clear(self):
+        self.c_atts.clear()
+        self.f_atts.clear()
+
+
+def register_attention_hooks(model):
+    """Register a forward hook on every OmniAttention3DSpatial that appends
+    c_att / f_att to the store when store.enabled is True.
+    Returns (store, handles). Caller must handle detachment."""
+    store = _AttnStore()
+    handles = []
+    for _name, mod in model.named_modules():
+        if isinstance(mod, OmniAttention3DSpatial):
+            def _hook(_module, _inp, out, _store=store):
+                if not _store.enabled:
+                    return
+                c_att, f_att, _s_att, _k_att = out
+                _store.c_atts.append(c_att)
+                _store.f_atts.append(f_att)
+            handles.append(mod.register_forward_hook(_hook))
+    return store, handles
+
+
+def attention_diversity_loss(store, target_std: float, device):
+    """Hinge penalty on low batch-std of c_att / f_att, averaged over layers."""
+    if not store.c_atts:
+        return torch.zeros((), device=device)
+    per_layer = []
+    for a in store.c_atts + store.f_atts:
+        if a.size(0) < 2:  # need at least 2 samples for meaningful std
+            continue
+        # Cast to fp32 for stable std under autocast.
+        std_per_ch = a.float().std(dim=0, unbiased=False)   # (C, 1, 1, 1)
+        mean_std   = std_per_ch.mean()                       # scalar
+        per_layer.append((target_std - mean_std).clamp(min=0))
+    if not per_layer:
+        return torch.zeros((), device=device)
+    return torch.stack(per_layer).mean()
+
+
+# ─────────────────────────────────────────────
+# 6. TRAIN
 # ─────────────────────────────────────────────
 
 def train(cfg, args):
@@ -321,7 +401,24 @@ def train(cfg, args):
         best_dice   = ckpt.get("best_dice", 0.0)
         print(f"Resumed from epoch {start_epoch} | best Dice: {best_dice:.4f}")
 
-    anneal_epochs = args.k_att_anneal_epochs or epochs
+    # k_att anneal window. If unset, default to ~60% of total epochs so the
+    # final 40% trains at t_end rather than a still-annealing softmax.
+    if args.k_att_anneal_epochs is not None:
+        anneal_epochs = args.k_att_anneal_epochs
+    else:
+        anneal_epochs = max(1, int(round(epochs * 0.6)))
+    print(f"k_att anneal window: {anneal_epochs} epochs "
+          f"({args.k_att_temp_start} -> {args.k_att_temp_end}); "
+          f"held at {args.k_att_temp_end} for the remaining {epochs - anneal_epochs} epochs")
+
+    # Attention diversity aux loss setup.
+    attn_store, attn_hook_handles = register_attention_hooks(model)
+    aux_enabled = args.attn_diversity_weight > 0.0
+    if aux_enabled:
+        print(f"Attention diversity aux loss: lambda={args.attn_diversity_weight}, "
+              f"target_std={args.attn_diversity_target}")
+    else:
+        print("Attention diversity aux loss: DISABLED (lambda=0)")
 
     print(f"\nStarting training: {epochs} epochs | LR {lr} | Batch {batch_size}")
     print("=" * 70)
@@ -339,6 +436,7 @@ def train(cfg, args):
         epoch_loss  = 0.0
         epoch_dice  = 0.0
         epoch_ce    = 0.0
+        epoch_aux   = 0.0
         num_batches = 0
         t0 = time.time()
 
@@ -358,12 +456,22 @@ def train(cfg, args):
                 labels = batch["label"].to(device)
 
             optimizer.zero_grad()
+            attn_store.clear()
+            attn_store.enabled = aux_enabled
             with autocast("cuda", enabled=device.type == "cuda"):
                 preds = model(images)
                 if isinstance(preds, tuple):
                     total_loss, dice_loss, ce_loss = deep_supervision_loss(preds, labels, criterion)
                 else:
                     total_loss, dice_loss, ce_loss = criterion(preds, labels)
+
+                if aux_enabled:
+                    aux_loss = attention_diversity_loss(
+                        attn_store, args.attn_diversity_target, device)
+                    total_loss = total_loss + args.attn_diversity_weight * aux_loss
+                else:
+                    aux_loss = torch.zeros((), device=device)
+            attn_store.enabled = False
 
             scaler.scale(total_loss).backward()
             scaler.unscale_(optimizer)
@@ -374,6 +482,7 @@ def train(cfg, args):
             epoch_loss  += total_loss.item()
             epoch_dice  += dice_loss.item()
             epoch_ce    += ce_loss.item()
+            epoch_aux   += float(aux_loss.detach().item())
             num_batches += 1
 
         pbar.close()
@@ -382,18 +491,20 @@ def train(cfg, args):
         avg_loss = epoch_loss / num_batches
         avg_dice = epoch_dice / num_batches
         avg_ce   = epoch_ce   / num_batches
+        avg_aux  = epoch_aux  / num_batches
         elapsed  = time.time() - t0
         lr_now   = scheduler.get_last_lr()[0]
         mins, secs = divmod(int(elapsed), 60)
         print(f"Epoch {epoch+1:03d}/{epochs} | T={t:.2f} | "
               f"Loss {avg_loss:.4f} | Dice {avg_dice:.4f} | CE {avg_ce:.4f} | "
-              f"LR {lr_now:.2e} | {mins}m{secs}s")
+              f"Aux {avg_aux:.4f} | LR {lr_now:.2e} | {mins}m{secs}s")
 
         log_entry = {
             "epoch":     epoch + 1,
             "loss":      avg_loss,
             "dice_loss": avg_dice,
             "ce_loss":   avg_ce,
+            "aux_loss":  avg_aux,
             "lr":        lr_now,
             "k_att_temperature": t,
             "time_s":    elapsed,
@@ -446,9 +557,14 @@ def train(cfg, args):
             "k_att_temp_start": args.k_att_temp_start,
             "k_att_temp_end": args.k_att_temp_end,
             "k_att_anneal_epochs": anneal_epochs,
+            "attn_diversity_weight": args.attn_diversity_weight,
+            "attn_diversity_target": args.attn_diversity_target,
             "best_dice": best_dice,
             "epochs": epochs,
         }, f, indent=2)
+
+    for h in attn_hook_handles:
+        h.remove()
 
     print(f"\nTraining complete. Best Val Dice: {best_dice:.4f}")
     print(f"Outputs saved to: {output_dir}")
