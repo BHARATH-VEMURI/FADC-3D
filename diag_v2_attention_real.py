@@ -45,14 +45,17 @@ def find_fadc_layers(model):
 def register_hooks(model, capture):
     handles = []
     for name, mod in find_fadc_layers(model):
-        capture[name] = {"c": [], "f": [], "k": []}
+        capture[name] = {"c": [], "f": [], "s": [], "k": []}
 
         def make_hook(nm):
             def hook(module, inp, out):
-                c_att, f_att, _s_att, k_att = out
+                c_att, f_att, s_att, k_att = out
                 capture[nm]["c"].append(c_att.detach().cpu())
                 capture[nm]["f"].append(f_att.detach().cpu())
-                capture[nm]["k"].append(k_att.detach().cpu())
+                if torch.is_tensor(s_att):
+                    capture[nm]["s"].append(s_att.detach().cpu())
+                if torch.is_tensor(k_att):
+                    capture[nm]["k"].append(k_att.detach().cpu())
             return hook
 
         handles.append(mod.register_forward_hook(make_hook(name)))
@@ -110,30 +113,51 @@ def load_real_patches(n_cases, patch_size):
 def summarize(capture, temperature_estimate, n_inputs):
     print(f"\nk_att temperature at this ckpt (cosine ep25/100): T ~ {temperature_estimate:.2f}")
     print(f"n real val patches: {n_inputs}")
-    print("=" * 112)
-    print(f"{'Layer':<28} {'c_att mean':>11} {'c_att std':>11} "
-          f"{'f_att mean':>11} {'f_att std':>11} "
-          f"{'k spatial-std':>15} {'k per-input-std':>17}")
-    print("-" * 112)
+    header = (f"{'Layer':<28} "
+              f"{'c mean':>8} {'c inp-std':>10} "
+              f"{'f mean':>8} {'f inp-std':>10} "
+              f"{'s inp-std':>10} "
+              f"{'k spat-std':>11} {'k inp-std':>10}")
+    print("=" * len(header))
+    print(header)
+    print("-" * len(header))
 
     for name in sorted(capture.keys()):
-        c_stack = torch.stack(capture[name]["c"], dim=0)
+        c_stack = torch.stack(capture[name]["c"], dim=0)   # (N, 1, C, 1, 1, 1)
         f_stack = torch.stack(capture[name]["f"], dim=0)
-        k_stack = torch.stack(capture[name]["k"], dim=0)
 
         c_mean = c_stack.mean().item()
-        c_std = c_stack.mean(dim=(2, 3, 4, 5)).std().item()
         f_mean = f_stack.mean().item()
-        f_std = f_stack.mean(dim=(2, 3, 4, 5)).std().item()
+        # Real-data path feeds one patch per forward, so batch dim is 1.
+        # "inp-std" = std over N of the per-image mean.
+        c_inp = c_stack.flatten(2).mean(dim=2).std().item()
+        f_inp = f_stack.flatten(2).mean(dim=2).std().item()
 
-        k0 = k_stack[:, 0, 0]     # (N, D, H, W) — branch-0 spatial map per input
-        spatial_std = k0.flatten(1).std(dim=1).mean().item()
-        per_input_std = k0.mean(dim=(1, 2, 3)).std().item()
+        if capture[name]["s"]:
+            s_stack = torch.stack(capture[name]["s"], dim=0)
+            s_inp = s_stack.flatten(2).mean(dim=2).std().item()
+            s_inp_s = f"{s_inp:.4f}"
+        else:
+            s_inp_s = "SKIP"
 
-        print(f"{name:<28} {c_mean:>11.4f} {c_std:>11.4f} "
-              f"{f_mean:>11.4f} {f_std:>11.4f} "
-              f"{spatial_std:>15.4f} {per_input_std:>17.4f}")
-    print("=" * 112)
+        if capture[name]["k"]:
+            k_stack = torch.stack(capture[name]["k"], dim=0)   # (N, 1, n_br, D, H, W)
+            k_flat = k_stack.float().flatten(3)                # (N, 1, n_br, D*H*W)
+            spatial_std = k_flat.std(dim=3, unbiased=False).mean().item()
+            # per-input branch-0 mean, std across N
+            per_input_std = k_stack[:, 0, 0].flatten(1).mean(dim=1).std().item()
+            k_spat_s = f"{spatial_std:.4f}"
+            k_inp_s = f"{per_input_std:.4f}"
+        else:
+            k_spat_s = "SKIP"
+            k_inp_s = "SKIP"
+
+        print(f"{name:<28} "
+              f"{c_mean:>8.4f} {c_inp:>10.4f} "
+              f"{f_mean:>8.4f} {f_inp:>10.4f} "
+              f"{s_inp_s:>10} "
+              f"{k_spat_s:>11} {k_inp_s:>10}")
+    print("=" * len(header))
 
 
 def estimate_temperature(epoch, anneal_epochs=100, t_start=4.0, t_end=0.8):

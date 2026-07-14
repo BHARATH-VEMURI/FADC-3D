@@ -243,29 +243,35 @@ def build_model(args, model_kwargs, fadc_kwargs, device):
 # past enc1 (batch-std < 0.005 at every deeper layer, dropping to 0.0002 at
 # enc4.c2 by ep30). k_att is fine because its 3x3x3 spatial trunk bypasses
 # the GAP that starves c_att/f_att of per-input signal. This aux loss
-# rewards non-trivial batch variation in c_att/f_att directly, so gradients
-# flow into the channel_fc / filter_fc weights that would otherwise stay
-# near their warm-init and produce near-constant outputs.
+# rewards non-trivial batch variation in c/f/s/k attention directly, so
+# gradients flow into channel_fc / filter_fc / spatial_fc / kernel_spatial_head
+# instead of drifting toward constant outputs.
 #
-# Formulation: hinge loss on batch-std per channel, averaged over layers.
-#   For each c_att / f_att tensor of shape (B, C, 1, 1, 1):
-#     std_per_ch = std over batch dim, shape (C, 1, 1, 1)
-#     mean_std   = mean over channels, scalar
-#     layer_loss = clamp(target - mean_std, min=0)
-#   Aux loss = mean over all layers of layer_loss.
-#   Total training loss = seg_loss + lambda * aux_loss.
-# Once mean_std reaches the target on a layer, that layer contributes 0.
+# v2.2 extension: collect s_att and k_att too.
+#   c_att (B, C_in,  1, 1, 1)              — hinge on batch-std, avg over C
+#   f_att (B, C_out, 1, 1, 1)              — hinge on batch-std, avg over C
+#   s_att (B, 1, 1, 1, 1, K, K, K)          — hinge on batch-std, avg over K^3
+#   k_att (B, num_branches, D, H, W)        — spatial-mean per (B, branch)
+#                                             first (so we reward input
+#                                             adaptivity of branch preference,
+#                                             not just per-voxel texture),
+#                                             then hinge on batch-std over B.
+# Total training loss = seg_loss + lambda * aux_loss.
 
 class _AttnStore:
-    """Per-batch collector for c_att / f_att tensors from every FADC layer."""
+    """Per-batch collector for c/f/s/k attention tensors from every FADC layer."""
     def __init__(self):
         self.enabled = False
         self.c_atts = []
         self.f_atts = []
+        self.s_atts = []
+        self.k_atts = []
 
     def clear(self):
         self.c_atts.clear()
         self.f_atts.clear()
+        self.s_atts.clear()
+        self.k_atts.clear()
 
 
 def _name_matches_prefixes(name: str, prefixes) -> bool:
@@ -302,26 +308,51 @@ def register_attention_hooks(model, layer_prefixes=None):
             def _hook(_module, _inp, out, _store=store):
                 if not _store.enabled:
                     return
-                c_att, f_att, _s_att, _k_att = out
+                c_att, f_att, s_att, k_att = out
                 _store.c_atts.append(c_att)
                 _store.f_atts.append(f_att)
+                if torch.is_tensor(s_att):
+                    _store.s_atts.append(s_att)
+                if torch.is_tensor(k_att):
+                    _store.k_atts.append(k_att)
             handles.append(mod.register_forward_hook(_hook))
             hooked_names.append(name)
     return store, handles, hooked_names
 
 
+def _hinge_batch_std(a: torch.Tensor, target_std: float):
+    """Hinge on the mean batch-std across all non-batch dims.
+    Returns None when there are fewer than 2 samples (std ill-defined)."""
+    if a.size(0) < 2:
+        return None
+    a = a.float()                                              # stable under autocast
+    std = a.std(dim=0, unbiased=False)                         # non-batch dims
+    return (target_std - std.mean()).clamp(min=0)
+
+
 def attention_diversity_loss(store, target_std: float, device):
-    """Hinge penalty on low batch-std of c_att / f_att, averaged over layers."""
-    if not store.c_atts:
-        return torch.zeros((), device=device)
+    """Hinge penalty on low batch-std of c / f / s / k attentions.
+
+    c/f/s: raw batch-std averaged over remaining dims.
+    k    : spatial-mean per (B, branch) first, THEN batch-std — this targets
+           input-adaptivity of branch preference, not per-voxel texture.
+    """
     per_layer = []
-    for a in store.c_atts + store.f_atts:
-        if a.size(0) < 2:  # need at least 2 samples for meaningful std
+
+    # c_att, f_att, s_att — treat identically: hinge on raw batch-std.
+    for a in store.c_atts + store.f_atts + store.s_atts:
+        term = _hinge_batch_std(a, target_std)
+        if term is not None:
+            per_layer.append(term)
+
+    # k_att — spatial-mean over (D, H, W) first, then hinge on batch-std.
+    for k in store.k_atts:
+        if k.size(0) < 2:
             continue
-        # Cast to fp32 for stable std under autocast.
-        std_per_ch = a.float().std(dim=0, unbiased=False)   # (C, 1, 1, 1)
-        mean_std   = std_per_ch.mean()                       # scalar
-        per_layer.append((target_std - mean_std).clamp(min=0))
+        k_summary = k.float().mean(dim=(2, 3, 4))              # (B, num_branches)
+        std_per_branch = k_summary.std(dim=0, unbiased=False)  # (num_branches,)
+        per_layer.append((target_std - std_per_branch.mean()).clamp(min=0))
+
     if not per_layer:
         return torch.zeros((), device=device)
     return torch.stack(per_layer).mean()

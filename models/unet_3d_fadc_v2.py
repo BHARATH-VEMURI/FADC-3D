@@ -26,19 +26,28 @@ _FS_CFG = dict(
 
 
 class FADCConvBlockV2(nn.Module):
-    """Two AdaptiveDilatedConv3DV2 → BN → ReLU with residual connection."""
+    """Two AdaptiveDilatedConv3DV2 → BN → f_att → ReLU with residual connection.
+
+    v2.2: f_att is applied AFTER BatchNorm so its channel scaling actually
+    survives — pre-BN scaling gets normalised away, which was exactly the
+    "f_att nearly static" symptom in the diagnostic. The inner
+    AdaptiveDilatedConv3DV2 is constructed with apply_filter_attention=False
+    and exposes the last f_att as `conv.last_filter_attention`.
+    """
     def __init__(self, in_ch, out_ch, dropout=0.15,
                  k_att_kernel_size=3, bias_init=0.5):
         super().__init__()
         self.conv1 = AdaptiveDilatedConv3DV2(
             in_ch, out_ch, kernel_size=3, bias=False, fs_cfg=_FS_CFG,
-            k_att_kernel_size=k_att_kernel_size, bias_init=bias_init)
+            k_att_kernel_size=k_att_kernel_size, bias_init=bias_init,
+            apply_filter_attention=False)
         self.bn1   = nn.BatchNorm3d(out_ch)
         self.relu1 = nn.ReLU(inplace=True)
         self.drop1 = nn.Dropout3d(p=dropout)
         self.conv2 = AdaptiveDilatedConv3DV2(
             out_ch, out_ch, kernel_size=3, bias=False, fs_cfg=_FS_CFG,
-            k_att_kernel_size=k_att_kernel_size, bias_init=bias_init)
+            k_att_kernel_size=k_att_kernel_size, bias_init=bias_init,
+            apply_filter_attention=False)
         self.bn2   = nn.BatchNorm3d(out_ch)
         self.relu2 = nn.ReLU(inplace=True)
 
@@ -52,8 +61,14 @@ class FADCConvBlockV2(nn.Module):
 
     def forward(self, x):
         identity = self.skip_proj(x)
-        out = self.drop1(self.relu1(self.bn1(self.conv1(x))))
+
+        out = self.bn1(self.conv1(x))
+        out = out * (self.conv1.last_filter_attention * 2)
+        out = self.drop1(self.relu1(out))
+
         out = self.bn2(self.conv2(out))
+        out = out * (self.conv2.last_filter_attention * 2)
+
         return self.relu2(out + identity)
 
 

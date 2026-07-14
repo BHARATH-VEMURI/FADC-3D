@@ -45,7 +45,7 @@ from models.unet_3d_fadc_v2 import UNet3DFADC_V2
 from fadc_3d_v2.omni_attention_3d_spatial import OmniAttention3DSpatial
 
 
-CKPT = r"C:\Users\bhara\Downloads\check\fadcencoderV2fixed\70\best_model.pth"
+CKPT = r"C:\Users\bhara\Downloads\check\fadcencoder_attention\30\best_model.pth"
 N_INPUTS = 8
 INPUT_SHAPE = (1, 2, 32, 32, 16)   # small — CPU-friendly
 
@@ -61,77 +61,116 @@ def register_hooks(model, capture):
     """Hook every OmniAttention3DSpatial.forward — writes into capture[name]."""
     handles = []
     for name, mod in find_fadc_layers(model):
-        capture[name] = {"c": [], "f": [], "k": []}
+        capture[name] = {"c": [], "f": [], "s": [], "k": []}
 
         def make_hook(nm):
             def hook(module, inp, out):
-                c_att, f_att, _s_att, k_att = out
+                c_att, f_att, s_att, k_att = out
                 capture[nm]["c"].append(c_att.detach().cpu())
                 capture[nm]["f"].append(f_att.detach().cpu())
-                capture[nm]["k"].append(k_att.detach().cpu())
+                # s_att and k_att may be a scalar 1.0 (skip path) on older configs.
+                if torch.is_tensor(s_att):
+                    capture[nm]["s"].append(s_att.detach().cpu())
+                if torch.is_tensor(k_att):
+                    capture[nm]["k"].append(k_att.detach().cpu())
             return hook
 
         handles.append(mod.register_forward_hook(make_hook(name)))
     return handles
 
 
+def _batched_and_input_std(stack):
+    """stack shape (N, B, ...) where each hook call captured a batch of size B.
+    Returns (input_std, batched_std): input_std is std across N (per-image batch
+    means), batched_std is mean std across the batch dim inside each hook call."""
+    # Per-hook mean over all non-batch dims -> (N, B)
+    per_batch_mean = stack.flatten(2).mean(dim=2)
+    input_std = per_batch_mean.std().item()
+
+    # Batch std inside each hook call, averaged over hooks. Requires B>=2.
+    if stack.shape[1] < 2:
+        batched_std = float("nan")
+    else:
+        # std across B within each hook, mean over the remaining dims, then avg over N.
+        std_within = stack.float().std(dim=1, unbiased=False)   # (N, ...)
+        batched_std = std_within.flatten(1).mean(dim=1).mean().item()
+    return input_std, batched_std
+
+
 def summarize(capture, temperature_estimate):
-    """Report per-layer adaptation metrics."""
+    """Report per-layer adaptation metrics for c/f/s/k."""
     print(f"\nEstimated k_att temperature at this checkpoint's epoch: ~{temperature_estimate:.2f}")
     print("(T=1.0 is 'normal sharp softmax'; T=4.0 is very soft; higher T pulls k_att toward uniform)")
     print()
-    print("=" * 108)
-    print(f"{'Layer':<28} {'c_att mean':>11} {'c_att std':>11} "
-          f"{'f_att mean':>11} {'f_att std':>11} "
-          f"{'k spatial-std':>15} {'k per-input-std':>17}")
-    print("-" * 108)
+    header = (f"{'Layer':<28} "
+              f"{'c mean':>8} {'c inp-std':>10} {'c bat-std':>10} "
+              f"{'f mean':>8} {'f inp-std':>10} {'f bat-std':>10} "
+              f"{'s inp-std':>10} {'s bat-std':>10} "
+              f"{'k spat-std':>11} {'k inp-std':>10}")
+    print("=" * len(header))
+    print(header)
+    print("-" * len(header))
 
     layer_names = sorted(capture.keys())
     for name in layer_names:
-        c_stack = torch.stack(capture[name]["c"], dim=0)    # (N, 1, C, 1, 1, 1)
-        f_stack = torch.stack(capture[name]["f"], dim=0)    # (N, 1, C, 1, 1, 1)
-        k_stack = torch.stack(capture[name]["k"], dim=0)    # (N, 1, n_br, D, H, W)
+        c_stack = torch.stack(capture[name]["c"], dim=0)
+        f_stack = torch.stack(capture[name]["f"], dim=0)
 
         c_mean = c_stack.mean().item()
-        c_std_across_inputs = c_stack.mean(dim=(2, 3, 4, 5)).std().item()
-
         f_mean = f_stack.mean().item()
-        f_std_across_inputs = f_stack.mean(dim=(2, 3, 4, 5)).std().item()
+        c_inp, c_bat = _batched_and_input_std(c_stack)
+        f_inp, f_bat = _batched_and_input_std(f_stack)
 
-        # k_att branch-0 spatial map per input: shape (N, D, H, W)
-        k0 = k_stack[:, 0, 0]
+        if capture[name]["s"]:
+            s_stack = torch.stack(capture[name]["s"], dim=0)
+            s_inp, s_bat = _batched_and_input_std(s_stack)
+            s_inp_s = f"{s_inp:.4f}"
+            s_bat_s = f"{s_bat:.4f}" if s_bat == s_bat else "  nan "
+        else:
+            s_inp_s = "SKIP"
+            s_bat_s = "SKIP"
 
-        # (a) SPATIAL std within one input, averaged across inputs
-        spatial_std = k0.flatten(1).std(dim=1).mean().item()
+        if capture[name]["k"]:
+            k_stack = torch.stack(capture[name]["k"], dim=0)   # (N, B, n_br, D, H, W)
+            # Spatial std WITHIN one (image, branch), averaged over N, B, branches.
+            k_flat = k_stack.float().flatten(3)                # (N, B, n_br, D*H*W)
+            spatial_std = k_flat.std(dim=3, unbiased=False).mean().item()
+            # PER-INPUT std of the spatial-mean of branch-0, across the N*B samples.
+            per_input_mean = k_stack[:, :, 0].flatten(2).mean(dim=2).flatten()
+            per_input_std = per_input_mean.std().item()
+            k_spat_s = f"{spatial_std:.4f}"
+            k_inp_s = f"{per_input_std:.4f}"
+        else:
+            k_spat_s = "SKIP"
+            k_inp_s = "SKIP"
 
-        # (b) PER-INPUT variation: spatial-mean per input, then std across inputs
-        per_input_mean = k0.mean(dim=(1, 2, 3))
-        per_input_std = per_input_mean.std().item()
+        print(f"{name:<28} "
+              f"{c_mean:>8.4f} {c_inp:>10.4f} {c_bat:>10.4f} "
+              f"{f_mean:>8.4f} {f_inp:>10.4f} {f_bat:>10.4f} "
+              f"{s_inp_s:>10} {s_bat_s:>10} "
+              f"{k_spat_s:>11} {k_inp_s:>10}")
 
-        print(f"{name:<28} {c_mean:>11.4f} {c_std_across_inputs:>11.4f} "
-              f"{f_mean:>11.4f} {f_std_across_inputs:>11.4f} "
-              f"{spatial_std:>15.4f} {per_input_std:>17.4f}")
-
-    print("=" * 108)
+    print("=" * len(header))
     print()
     print("INTERPRETATION GUIDE")
     print("--------------------")
-    print("c_att / f_att (per-image, temperature-independent):")
-    print("  mean ~ 0.500 + std < 0.005  -> V1 identity collapse (bias=0, sigmoid(0)=0.5)")
-    print("  mean ~ 0.622 + std < 0.005  -> V2 warm init took, but attention NOT adapting per input")
-    print("  mean anywhere + std > 0.010 -> attention IS varying across inputs (working)")
+    print("USED IN FORWARD:  a column shows a number (not 'SKIP') -> attention path is live.")
+    print("INPUT-ADAPTIVE :  'inp-std' or 'k inp-std' > ~0.010 -> attention varies across inputs.")
+    print("BATCH-ADAPTIVE :  'bat-std' > ~0.010 -> attention varies across samples within a mini-batch.")
     print()
-    print("k_att (per-voxel spatial, temperature-modulated):")
-    print("  spatial-std < 0.005 -> uniform value across space (v1-style collapse)")
-    print("  spatial-std > 0.010 -> spatial variation within one input (v2 promise fulfilled)")
-    print("  BUT AT HIGH T (>= 3.0), even a working v2 gives small spatial-std")
-    print("  because the softmax is still soft. Re-run at ep100 for definitive read.")
+    print("c/f: mean ~ 0.622 + std < 0.005  -> warm init kept, attention NOT adapting.")
+    print("c/f: std > 0.010                 -> attention IS varying (working).")
     print()
-    print("per-input-std (how much k_att's average changes between inputs):")
-    print("  > 0.005 -> model is learning per-input dilation preference (any T)")
+    print("s : inp-std > 0.005 -> spatial kernel-position attention adapts to input (v2.2 goal).")
+    print()
+    print("k : spat-std > 0.010 -> per-voxel spatial variation (v2 promise).")
+    print("k : inp-std  > 0.005 -> per-input branch preference (v2.2 aux target).")
+    print("    at HIGH T (>= 3.0) softmax is still soft, so small values are expected until T -> 1.")
 
 
-def estimate_temperature(epoch, anneal_epochs=100, t_start=4.0, t_end=0.8):
+def estimate_temperature(epoch, anneal_epochs=60, t_start=4.0, t_end=0.5):
+    """Defaults match feature/attention-diversity-loss (t_end=0.5, anneal 60ep).
+    For v2.1 checkpoints, override with anneal_epochs=100, t_end=0.8."""
     import math
     if anneal_epochs <= 1:
         return t_end
