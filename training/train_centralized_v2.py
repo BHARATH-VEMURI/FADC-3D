@@ -119,6 +119,18 @@ def parse_args():
                              "should target. Empty string means ALL FADC layers (v2.1 "
                              "behaviour). Default '%(default)s' — apply only to deep encoder "
                              "layers where c_att/f_att collapse is most severe.")
+    # Per-head aux weights (v2.2). Applied INSIDE attention_diversity_loss on top
+    # of --attn_diversity_weight, so total aux term = lambda * (w_c*aux_c + w_f*aux_f
+    # + w_s*aux_s + w_k*aux_k). Defaults bias hard toward f (dead everywhere) then c
+    # (deep collapse); s and k are already working, so their weights are small.
+    parser.add_argument("--aux_c_weight", type=float, default=2.0,
+                        help="Per-head weight for c_att inside the diversity aux. Default %(default)s.")
+    parser.add_argument("--aux_f_weight", type=float, default=4.0,
+                        help="Per-head weight for f_att inside the diversity aux. Default %(default)s.")
+    parser.add_argument("--aux_s_weight", type=float, default=0.75,
+                        help="Per-head weight for s_att inside the diversity aux. Default %(default)s.")
+    parser.add_argument("--aux_k_weight", type=float, default=0.25,
+                        help="Per-head weight for k_att inside the diversity aux. Default %(default)s.")
     return parser.parse_args()
 
 
@@ -330,32 +342,49 @@ def _hinge_batch_std(a: torch.Tensor, target_std: float):
     return (target_std - std.mean()).clamp(min=0)
 
 
-def attention_diversity_loss(store, target_std: float, device):
-    """Hinge penalty on low batch-std of c / f / s / k attentions.
+def _mean_hinge(att_list, target_std: float, device):
+    """Mean over layers of the per-layer batch-std hinge (c/f/s)."""
+    terms = []
+    for a in att_list:
+        t = _hinge_batch_std(a, target_std)
+        if t is not None:
+            terms.append(t)
+    if not terms:
+        return torch.zeros((), device=device)
+    return torch.stack(terms).mean()
 
-    c/f/s: raw batch-std averaged over remaining dims.
-    k    : spatial-mean per (B, branch) first, THEN batch-std — this targets
-           input-adaptivity of branch preference, not per-voxel texture.
-    """
-    per_layer = []
 
-    # c_att, f_att, s_att — treat identically: hinge on raw batch-std.
-    for a in store.c_atts + store.f_atts + store.s_atts:
-        term = _hinge_batch_std(a, target_std)
-        if term is not None:
-            per_layer.append(term)
-
-    # k_att — spatial-mean over (D, H, W) first, then hinge on batch-std.
-    for k in store.k_atts:
+def _mean_hinge_k(k_list, target_std: float, device):
+    """Same as _mean_hinge but for k_att: spatial-mean over (D, H, W) first
+    so we reward input-adaptivity of branch preference, not per-voxel texture."""
+    terms = []
+    for k in k_list:
         if k.size(0) < 2:
             continue
         k_summary = k.float().mean(dim=(2, 3, 4))              # (B, num_branches)
         std_per_branch = k_summary.std(dim=0, unbiased=False)  # (num_branches,)
-        per_layer.append((target_std - std_per_branch.mean()).clamp(min=0))
-
-    if not per_layer:
+        terms.append((target_std - std_per_branch.mean()).clamp(min=0))
+    if not terms:
         return torch.zeros((), device=device)
-    return torch.stack(per_layer).mean()
+    return torch.stack(terms).mean()
+
+
+def attention_diversity_loss(store, target_std: float, device, weights):
+    """Return (weighted_total, per_head_dict) — the per-head values are raw
+    (unweighted) so downstream logging can compare heads on the same scale.
+
+    weights: dict with keys 'c','f','s','k' — per-head multipliers applied to
+    the total. Total training term = args.attn_diversity_weight * weighted_total.
+    """
+    aux_c = _mean_hinge(store.c_atts,  target_std, device)
+    aux_f = _mean_hinge(store.f_atts,  target_std, device)
+    aux_s = _mean_hinge(store.s_atts,  target_std, device)
+    aux_k = _mean_hinge_k(store.k_atts, target_std, device)
+    total = (weights['c'] * aux_c
+             + weights['f'] * aux_f
+             + weights['s'] * aux_s
+             + weights['k'] * aux_k)
+    return total, {'c': aux_c, 'f': aux_f, 's': aux_s, 'k': aux_k}
 
 
 # ─────────────────────────────────────────────
@@ -481,6 +510,10 @@ def train(cfg, args):
     layer_prefixes = [p.strip() for p in args.attn_diversity_layers.split(",") if p.strip()]
     attn_store, attn_hook_handles, hooked_names = register_attention_hooks(
         model, layer_prefixes=layer_prefixes or None)
+    aux_weights = {
+        'c': args.aux_c_weight, 'f': args.aux_f_weight,
+        's': args.aux_s_weight, 'k': args.aux_k_weight,
+    }
     aux_configured = args.attn_diversity_weight > 0.0
     if aux_configured:
         if hooked_names:
@@ -489,6 +522,8 @@ def train(cfg, args):
                   f"target_std={args.attn_diversity_target}, "
                   f"start_epoch={args.attn_diversity_start_epoch}, "
                   f"layer_prefixes=[{layer_desc}] "
+                  f"per_head_weights=(c={aux_weights['c']}, f={aux_weights['f']}, "
+                  f"s={aux_weights['s']}, k={aux_weights['k']}) "
                   f"({len(hooked_names)} layer(s) hooked: {hooked_names})")
         else:
             print(f"WARNING: layer_prefixes {layer_prefixes} matched 0 FADC layers. "
@@ -521,6 +556,10 @@ def train(cfg, args):
         epoch_dice  = 0.0
         epoch_ce    = 0.0
         epoch_aux   = 0.0
+        epoch_aux_c = 0.0
+        epoch_aux_f = 0.0
+        epoch_aux_s = 0.0
+        epoch_aux_k = 0.0
         num_batches = 0
         t0 = time.time()
 
@@ -550,11 +589,13 @@ def train(cfg, args):
                     total_loss, dice_loss, ce_loss = criterion(preds, labels)
 
                 if aux_active_this_epoch:
-                    aux_loss = attention_diversity_loss(
-                        attn_store, args.attn_diversity_target, device)
+                    aux_loss, aux_per_head = attention_diversity_loss(
+                        attn_store, args.attn_diversity_target, device, aux_weights)
                     total_loss = total_loss + args.attn_diversity_weight * aux_loss
                 else:
                     aux_loss = torch.zeros((), device=device)
+                    _zero = torch.zeros((), device=device)
+                    aux_per_head = {'c': _zero, 'f': _zero, 's': _zero, 'k': _zero}
             attn_store.enabled = False
 
             scaler.scale(total_loss).backward()
@@ -567,21 +608,31 @@ def train(cfg, args):
             epoch_dice  += dice_loss.item()
             epoch_ce    += ce_loss.item()
             epoch_aux   += float(aux_loss.detach().item())
+            epoch_aux_c += float(aux_per_head['c'].detach().item())
+            epoch_aux_f += float(aux_per_head['f'].detach().item())
+            epoch_aux_s += float(aux_per_head['s'].detach().item())
+            epoch_aux_k += float(aux_per_head['k'].detach().item())
             num_batches += 1
 
         pbar.close()
         scheduler.step()
 
-        avg_loss = epoch_loss / num_batches
-        avg_dice = epoch_dice / num_batches
-        avg_ce   = epoch_ce   / num_batches
-        avg_aux  = epoch_aux  / num_batches
+        avg_loss  = epoch_loss  / num_batches
+        avg_dice  = epoch_dice  / num_batches
+        avg_ce    = epoch_ce    / num_batches
+        avg_aux   = epoch_aux   / num_batches
+        avg_aux_c = epoch_aux_c / num_batches
+        avg_aux_f = epoch_aux_f / num_batches
+        avg_aux_s = epoch_aux_s / num_batches
+        avg_aux_k = epoch_aux_k / num_batches
         elapsed  = time.time() - t0
         lr_now   = scheduler.get_last_lr()[0]
         mins, secs = divmod(int(elapsed), 60)
         print(f"Epoch {epoch+1:03d}/{epochs} | T={t:.2f} | "
               f"Loss {avg_loss:.4f} | Dice {avg_dice:.4f} | CE {avg_ce:.4f} | "
-              f"Aux {avg_aux:.4f} | LR {lr_now:.2e} | {mins}m{secs}s")
+              f"Aux {avg_aux:.4f} "
+              f"(c={avg_aux_c:.4f} f={avg_aux_f:.4f} s={avg_aux_s:.4f} k={avg_aux_k:.4f}) | "
+              f"LR {lr_now:.2e} | {mins}m{secs}s")
 
         log_entry = {
             "epoch":     epoch + 1,
@@ -589,6 +640,10 @@ def train(cfg, args):
             "dice_loss": avg_dice,
             "ce_loss":   avg_ce,
             "aux_loss":  avg_aux,
+            "aux_c":     avg_aux_c,
+            "aux_f":     avg_aux_f,
+            "aux_s":     avg_aux_s,
+            "aux_k":     avg_aux_k,
             "lr":        lr_now,
             "k_att_temperature": t,
             "time_s":    elapsed,
@@ -646,6 +701,10 @@ def train(cfg, args):
             "attn_diversity_start_epoch": args.attn_diversity_start_epoch,
             "attn_diversity_layers": args.attn_diversity_layers,
             "attn_diversity_hooked_names": hooked_names,
+            "aux_c_weight": args.aux_c_weight,
+            "aux_f_weight": args.aux_f_weight,
+            "aux_s_weight": args.aux_s_weight,
+            "aux_k_weight": args.aux_k_weight,
             "best_dice": best_dice,
             "epochs": epochs,
         }, f, indent=2)

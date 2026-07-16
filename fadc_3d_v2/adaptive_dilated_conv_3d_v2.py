@@ -29,6 +29,19 @@ v2.2 additions (this file):
     the pre-BN filter scaling out. When `apply_filter_attention=False`
     the module stores `self.last_filter_attention` and the caller (see
     FADCConvBlockV2) applies it AFTER BN, where it actually survives.
+
+  * GATE MODE for c_att and f_att.
+      'multiply': legacy v2/v2.1 behaviour, out = x * (att * 2). Destructive
+                  — att=0 kills the signal entirely, gradient is small when
+                  output magnitude is small.
+      'residual': out = x * (1 + gamma * (2*att - 1)). Identity at att=0.5,
+                  range [1-gamma, 1+gamma]. gamma=1.0 preserves the [0, 2]
+                  span of 'multiply' but centred on identity; gamma<1.0 is
+                  more conservative (never fully kills the signal).
+    Both modes leave the attention values themselves unchanged — only how
+    they modulate the feature map differs. The caller (FADCConvBlockV2)
+    reads the ready-to-multiply tensor from `self.last_filter_attention_mul`
+    so it applies the same gate f_att would have used inside the conv.
 """
 import torch
 import torch.nn as nn
@@ -36,6 +49,30 @@ import torch.nn.functional as F
 
 from fadc_3d_v2.omni_attention_3d_spatial import OmniAttention3DSpatial
 from fadc_3d_v2.freq_select_3d import FrequencySelection3D
+
+
+def _apply_gate(x, att, mode: str, gamma: float):
+    """Modulate `x` by attention `att` (sigmoid in [0, 1]).
+      'multiply': x * (att * 2)                      — legacy destructive gate.
+      'residual': x * (1 + gamma * (2*att - 1))      — identity at att=0.5.
+    """
+    if mode == 'multiply':
+        return x * (att * 2)
+    if mode == 'residual':
+        return x * (1.0 + gamma * (2.0 * att - 1.0))
+    raise ValueError(f"unknown gate mode: {mode!r}")
+
+
+def _gate_multiplier(att, mode: str, gamma: float):
+    """Return the ready-to-multiply tensor for a given gate mode.
+    Callers that want to apply the gate later (e.g. post-BN) can just do
+      out = raw_out * _gate_multiplier(att, mode, gamma).
+    """
+    if mode == 'multiply':
+        return att * 2
+    if mode == 'residual':
+        return 1.0 + gamma * (2.0 * att - 1.0)
+    raise ValueError(f"unknown gate mode: {mode!r}")
 
 
 def _conv_with_spatial_att(conv: nn.Conv3d, x: torch.Tensor, s_att):
@@ -115,7 +152,10 @@ class AdaptiveDilatedConv3DV2(nn.Module):
                  fs_cfg=None,
                  k_att_kernel_size=3,
                  bias_init=0.5,
-                 apply_filter_attention=True):
+                 apply_filter_attention=True,
+                 channel_gate_mode='residual',
+                 filter_gate_mode='residual',
+                 gate_gamma=1.0):
         super().__init__()
         if dilation_list is None:
             dilation_list = [1, 2]
@@ -124,9 +164,13 @@ class AdaptiveDilatedConv3DV2(nn.Module):
         self.out_channels = out_channels
         self.dilation_list = dilation_list
         self.apply_filter_attention = apply_filter_attention
+        self.channel_gate_mode = channel_gate_mode
+        self.filter_gate_mode  = filter_gate_mode
+        self.gate_gamma        = float(gate_gamma)
         # Populated on every forward so callers that want f_att post-BN can
         # read it without re-running the attention module.
-        self.last_filter_attention = None
+        self.last_filter_attention     = None   # raw sigmoid in [0, 1]
+        self.last_filter_attention_mul = None   # ready-to-multiply tensor
 
         # One dilated conv branch per dilation rate (unchanged from v1)
         self.conv_branches = nn.ModuleList()
@@ -180,19 +224,23 @@ class AdaptiveDilatedConv3DV2(nn.Module):
         # Step 1 — frequency pre-selection
         x_fs = self.fs(x)
 
-        # Step 2 — attention signals. s_att is now a real tensor (v2.2),
-        # k_att is spatial (v2), c/f are pooled sigmoids.
+        # Step 2 — attention signals. s_att is a real tensor (v2.2), k_att is
+        # spatial (v2), c/f are pooled sigmoids in [0, 1].
         c_att, f_att, s_att, k_att = self.omni_att(x_fs)
 
-        # Cache f_att so FADCConvBlockV2 can apply it AFTER BN.
-        self.last_filter_attention = f_att
+        # Cache f_att raw + the ready multiplier for FADCConvBlockV2 to
+        # apply AFTER BN with the same gate mode configured here.
+        self.last_filter_attention     = f_att
+        self.last_filter_attention_mul = _gate_multiplier(
+            f_att, self.filter_gate_mode, self.gate_gamma)
 
-        # Step 3 — channel-gate the input
-        x_in = x_fs * (c_att * 2)
+        # Step 3 — channel-gate the input (residual-centred by default in v2.2)
+        x_in = _apply_gate(x_fs, c_att, self.channel_gate_mode, self.gate_gamma)
 
         # Step 4 — run each dilated branch. s_att modulates the kernel
         # positions per sample via grouped conv (falls back to plain conv
-        # if s_att is a scalar skip).
+        # if s_att is a scalar skip). s_att gate is *multiply* (unchanged) —
+        # per user directive s_att grouped-conv application stays as-is.
         branch_outs = torch.stack(
             [_conv_with_spatial_att(conv, x_in, s_att) for conv in self.conv_branches],
             dim=1,
@@ -204,9 +252,9 @@ class AdaptiveDilatedConv3DV2(nn.Module):
 
         # Step 6 — filter-gate the output ONLY if the caller wants us to.
         # When apply_filter_attention=False, the caller reads
-        # self.last_filter_attention and applies it after BN.
+        # self.last_filter_attention_mul and applies it after BN.
         if self.apply_filter_attention:
-            out = out * (f_att * 2)
+            out = out * self.last_filter_attention_mul
         return out
 
 
