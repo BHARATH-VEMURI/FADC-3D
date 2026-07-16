@@ -37,7 +37,7 @@ class FADCConvBlockV2(nn.Module):
     def __init__(self, in_ch, out_ch, dropout=0.15,
                  k_att_kernel_size=3, bias_init=0.5,
                  channel_gate_mode='residual', filter_gate_mode='residual',
-                 gate_gamma=1.0):
+                 channel_gate_alpha_init=0.1, filter_gate_alpha_init=0.1):
         super().__init__()
         common = dict(
             kernel_size=3, bias=False, fs_cfg=_FS_CFG,
@@ -45,7 +45,8 @@ class FADCConvBlockV2(nn.Module):
             apply_filter_attention=False,
             channel_gate_mode=channel_gate_mode,
             filter_gate_mode=filter_gate_mode,
-            gate_gamma=gate_gamma,
+            channel_gate_alpha_init=channel_gate_alpha_init,
+            filter_gate_alpha_init=filter_gate_alpha_init,
         )
         self.conv1 = AdaptiveDilatedConv3DV2(in_ch, out_ch, **common)
         self.bn1   = nn.BatchNorm3d(out_ch)

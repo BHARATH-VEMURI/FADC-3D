@@ -75,16 +75,26 @@ def test_last_filter_attention_stored():
             f"{tag}.last_filter_attention_mul was not populated"
         assert conv.apply_filter_attention is False, \
             f"{tag}.apply_filter_attention must be False so BN sees the un-scaled conv output"
-        # Residual mode is default in v2.2 → multiplier centred on 1.0.
+        # v2.2 safe residual: alpha_init=0.1 → multiplier in [0.9, 1.1] at init.
         mul = conv.last_filter_attention_mul
         assert torch.isfinite(mul).all(), f"{tag}.last_filter_attention_mul has NaN/inf"
-        assert (mul >= 0).all() and (mul <= 2).all(), \
-            f"{tag}.last_filter_attention_mul out of expected [0, 2] range: min={mul.min().item()} max={mul.max().item()}"
-    print("  both convs expose non-None last_filter_attention + finite mul in [0, 2]  OK")
+        assert (mul >= 0.85).all() and (mul <= 1.15).all(), \
+            (f"{tag}.last_filter_attention_mul out of safe-init [0.85, 1.15] band: "
+             f"min={mul.min().item():.4f} max={mul.max().item():.4f}")
+        # alphas exist as learnable Parameters and start at 0.1.
+        assert isinstance(conv.channel_gate_alpha, torch.nn.Parameter), \
+            f"{tag}.channel_gate_alpha not an nn.Parameter"
+        assert isinstance(conv.filter_gate_alpha, torch.nn.Parameter), \
+            f"{tag}.filter_gate_alpha not an nn.Parameter"
+        assert abs(conv.channel_gate_alpha.item() - 0.1) < 1e-6, \
+            f"{tag}.channel_gate_alpha init != 0.1 (got {conv.channel_gate_alpha.item()})"
+        assert abs(conv.filter_gate_alpha.item() - 0.1) < 1e-6, \
+            f"{tag}.filter_gate_alpha init != 0.1 (got {conv.filter_gate_alpha.item()})"
+    print("  both convs: last_filter_attention_mul in [0.85, 1.15]; alphas are Parameters init 0.1  OK")
 
 
 def test_gate_modes():
-    print("[2b] residual gate is default; multiply mode still works")
+    print("[2b] residual (safe alpha=0.1) is default; multiply mode still works")
     torch.manual_seed(0)
     m_res = AdaptiveDilatedConv3DV2(4, 8, kernel_size=3)
     assert m_res.filter_gate_mode == 'residual', "v2.2 default filter_gate_mode should be 'residual'"
@@ -95,18 +105,25 @@ def test_gate_modes():
     y_res = m_res(x)
     y_mul = m_mul(x)
     assert y_res.shape == y_mul.shape == (2, 8, 8, 12, 12)
-    print(f"  residual mode ready-mul range [{m_res.last_filter_attention_mul.min().item():.3f}, "
-          f"{m_res.last_filter_attention_mul.max().item():.3f}]  |  "
-          f"multiply mode ready-mul range [{m_mul.last_filter_attention_mul.min().item():.3f}, "
-          f"{m_mul.last_filter_attention_mul.max().item():.3f}]  OK")
+    assert torch.isfinite(y_res).all() and torch.isfinite(y_mul).all(), "NaN or inf in forward output"
+    res_mul = m_res.last_filter_attention_mul
+    mul_mul = m_mul.last_filter_attention_mul
+    # Residual with alpha=0.1 must sit tightly around identity; multiply spans [0, 2].
+    assert (res_mul >= 0.85).all() and (res_mul <= 1.15).all(), \
+        f"residual ready-mul out of safe band: [{res_mul.min().item():.3f}, {res_mul.max().item():.3f}]"
+    print(f"  residual (alpha=0.1) ready-mul range [{res_mul.min().item():.3f}, "
+          f"{res_mul.max().item():.3f}]  |  "
+          f"multiply ready-mul range [{mul_mul.min().item():.3f}, "
+          f"{mul_mul.max().item():.3f}]  OK")
 
 
 def test_backward_grads_all_heads():
-    print("[3] backward produces gradients for shared_fc + c/f trunks + c/f/s/k heads")
+    print("[3] backward produces gradients for shared_fc + c/f trunks + c/f/s/k heads + gate alphas")
     torch.manual_seed(0)
     m = AdaptiveDilatedConv3DV2(4, 8, kernel_size=3)
     x = torch.randn(2, 4, 8, 12, 12, requires_grad=False)
     y = m(x)
+    assert torch.isfinite(y).all(), "forward produced NaN or inf"
     y.sum().backward()
 
     omni = m.omni_att
@@ -118,6 +135,17 @@ def test_backward_grads_all_heads():
     assert omni.spatial_fc is not None, "spatial_fc missing — kernel_size=1 was passed?"
     _grad_ok(omni.spatial_fc.weight, "spatial_fc.weight (s_att head)")
     _grad_ok(omni.kernel_spatial_head.weight, "kernel_spatial_head.weight (k_att)")
+    # v2.2 safe residual: the per-gate learnable alphas must receive gradients.
+    _grad_ok(m.channel_gate_alpha, "channel_gate_alpha (learnable)")
+    _grad_ok(m.filter_gate_alpha,  "filter_gate_alpha  (learnable)")
+
+    # Sanity: k_att spatial variation is still strong; s_att is still live.
+    with torch.no_grad():
+        c_att, f_att, s_att, k_att = m.omni_att(m.fs(x))
+    k_spat_std = k_att.float().flatten(3).std(dim=3, unbiased=False).mean().item()
+    assert torch.is_tensor(s_att), "s_att degraded to scalar — spatial_fc lost?"
+    assert k_spat_std > 0.05, f"k_att spatial variation collapsed: spat-std={k_spat_std:.4f} (< 0.05)"
+    print(f"  k_att spat-std = {k_spat_std:.4f}  |  s_att tensor live  (k+s preserved)")
 
 
 def test_unet_forward_smoke():

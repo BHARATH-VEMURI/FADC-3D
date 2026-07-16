@@ -34,10 +34,14 @@ v2.2 additions (this file):
       'multiply': legacy v2/v2.1 behaviour, out = x * (att * 2). Destructive
                   — att=0 kills the signal entirely, gradient is small when
                   output magnitude is small.
-      'residual': out = x * (1 + gamma * (2*att - 1)). Identity at att=0.5,
-                  range [1-gamma, 1+gamma]. gamma=1.0 preserves the [0, 2]
-                  span of 'multiply' but centred on identity; gamma<1.0 is
-                  more conservative (never fully kills the signal).
+      'residual': out = x * (1 + alpha * (2*att - 1)). alpha is a per-gate
+                  LEARNABLE scalar (self.channel_gate_alpha /
+                  self.filter_gate_alpha, each nn.Parameter initialised to
+                  0.1 by default). At init the multiplier is in a tight
+                  band around identity (0.9–1.1 with alpha=0.1), so the
+                  gate cannot destructively perturb the signal early on;
+                  the segmentation loss and the aux hinge together grow
+                  alpha only when the gate actually helps.
     Both modes leave the attention values themselves unchanged — only how
     they modulate the feature map differs. The caller (FADCConvBlockV2)
     reads the ready-to-multiply tensor from `self.last_filter_attention_mul`
@@ -51,27 +55,28 @@ from fadc_3d_v2.omni_attention_3d_spatial import OmniAttention3DSpatial
 from fadc_3d_v2.freq_select_3d import FrequencySelection3D
 
 
-def _apply_gate(x, att, mode: str, gamma: float):
+def _apply_gate(x, att, mode: str, alpha):
     """Modulate `x` by attention `att` (sigmoid in [0, 1]).
       'multiply': x * (att * 2)                      — legacy destructive gate.
-      'residual': x * (1 + gamma * (2*att - 1))      — identity at att=0.5.
+      'residual': x * (1 + alpha * (2*att - 1))      — identity at att=0.5.
+    `alpha` may be a float (fixed) or a 0-d tensor / nn.Parameter (learnable).
     """
     if mode == 'multiply':
         return x * (att * 2)
     if mode == 'residual':
-        return x * (1.0 + gamma * (2.0 * att - 1.0))
+        return x * (1.0 + alpha * (2.0 * att - 1.0))
     raise ValueError(f"unknown gate mode: {mode!r}")
 
 
-def _gate_multiplier(att, mode: str, gamma: float):
+def _gate_multiplier(att, mode: str, alpha):
     """Return the ready-to-multiply tensor for a given gate mode.
     Callers that want to apply the gate later (e.g. post-BN) can just do
-      out = raw_out * _gate_multiplier(att, mode, gamma).
+      out = raw_out * _gate_multiplier(att, mode, alpha).
     """
     if mode == 'multiply':
         return att * 2
     if mode == 'residual':
-        return 1.0 + gamma * (2.0 * att - 1.0)
+        return 1.0 + alpha * (2.0 * att - 1.0)
     raise ValueError(f"unknown gate mode: {mode!r}")
 
 
@@ -155,7 +160,8 @@ class AdaptiveDilatedConv3DV2(nn.Module):
                  apply_filter_attention=True,
                  channel_gate_mode='residual',
                  filter_gate_mode='residual',
-                 gate_gamma=1.0):
+                 channel_gate_alpha_init=0.1,
+                 filter_gate_alpha_init=0.1):
         super().__init__()
         if dilation_list is None:
             dilation_list = [1, 2]
@@ -166,7 +172,15 @@ class AdaptiveDilatedConv3DV2(nn.Module):
         self.apply_filter_attention = apply_filter_attention
         self.channel_gate_mode = channel_gate_mode
         self.filter_gate_mode  = filter_gate_mode
-        self.gate_gamma        = float(gate_gamma)
+        # Per-gate LEARNABLE residual-gate scales. Small at init (0.1 by
+        # default) so the gate multiplier stays in a tight band around
+        # identity (0.9–1.1) and cannot destructively perturb the signal
+        # while c_att / f_att are still random. Training grows or shrinks
+        # each alpha independently based on how useful its gate is.
+        self.channel_gate_alpha = nn.Parameter(
+            torch.tensor(float(channel_gate_alpha_init)))
+        self.filter_gate_alpha  = nn.Parameter(
+            torch.tensor(float(filter_gate_alpha_init)))
         # Populated on every forward so callers that want f_att post-BN can
         # read it without re-running the attention module.
         self.last_filter_attention     = None   # raw sigmoid in [0, 1]
@@ -229,13 +243,14 @@ class AdaptiveDilatedConv3DV2(nn.Module):
         c_att, f_att, s_att, k_att = self.omni_att(x_fs)
 
         # Cache f_att raw + the ready multiplier for FADCConvBlockV2 to
-        # apply AFTER BN with the same gate mode configured here.
+        # apply AFTER BN with the same gate mode + learnable alpha.
         self.last_filter_attention     = f_att
         self.last_filter_attention_mul = _gate_multiplier(
-            f_att, self.filter_gate_mode, self.gate_gamma)
+            f_att, self.filter_gate_mode, self.filter_gate_alpha)
 
-        # Step 3 — channel-gate the input (residual-centred by default in v2.2)
-        x_in = _apply_gate(x_fs, c_att, self.channel_gate_mode, self.gate_gamma)
+        # Step 3 — channel-gate the input (residual-centred by default,
+        # scaled by the learnable channel_gate_alpha).
+        x_in = _apply_gate(x_fs, c_att, self.channel_gate_mode, self.channel_gate_alpha)
 
         # Step 4 — run each dilated branch. s_att modulates the kernel
         # positions per sample via grouped conv (falls back to plain conv
