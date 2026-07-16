@@ -10,7 +10,7 @@ data:
   persistent_cache_dir: ""    # if set, use PersistentDataset (preprocess once to disk)
 
 training:
-  epochs: 300
+  epochs: 100
   batch_size: 2
   lr: 1.0e-4
   dice_weight: 0.5

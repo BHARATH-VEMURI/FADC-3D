@@ -45,7 +45,7 @@ from models.unet_3d_fadc_v2 import UNet3DFADC_V2
 from fadc_3d_v2.omni_attention_3d_spatial import OmniAttention3DSpatial
 
 
-CKPT = r"C:\Users\bhara\Downloads\check\fadcencoder_attention\30\best_model.pth"
+CKPT = r"C:\Users\bhara\Downloads\check\fadcenc0der_attentions_v2_2\40\best_model.pth"
 N_INPUTS = 8
 INPUT_SHAPE = (1, 2, 32, 32, 16)   # small — CPU-friendly
 
@@ -168,8 +168,8 @@ def summarize(capture, temperature_estimate):
     print("    at HIGH T (>= 3.0) softmax is still soft, so small values are expected until T -> 1.")
 
 
-def estimate_temperature(epoch, anneal_epochs=60, t_start=4.0, t_end=0.5):
-    """Defaults match feature/attention-diversity-loss (t_end=0.5, anneal 60ep).
+def estimate_temperature(epoch, anneal_epochs=60, t_start=4.0, t_end=0.8):
+    """Defaults match v2.2 launch args (t_end=0.8, anneal 60ep).
     For v2.1 checkpoints, override with anneal_epochs=100, t_end=0.8."""
     import math
     if anneal_epochs <= 1:

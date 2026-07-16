@@ -40,6 +40,7 @@ sys.path.append(str(Path(__file__).parent))
 from data.mama_mia_dataset import build_centralized_loaders
 from models.unet_3d import UNet3D
 from models.unet_3d_fadc import UNet3DFADC
+from models.unet_3d_fadc_v2 import UNet3DFADC_V2
 
 
 # ─────────────────────────────────────────────
@@ -55,6 +56,15 @@ _FADC_PLACEMENT = {
     "unet3d_fadc_deep_lite":    "deep_lite",
 }
 
+_FADC_V2_PLACEMENT = {
+    "unet3d_fadc_v2":            "full",
+    "unet3d_fadc_encoder_v2":    "encoder",
+    "unet3d_fadc_bottleneck_v2": "bottleneck",
+    "unet3d_fadc_mid_v2":        "mid",
+    "unet3d_fadc_deep_v2":       "deep",
+    "unet3d_fadc_deep_lite_v2":  "deep_lite",
+}
+
 
 def build_model(model_name: str, cfg: dict, device: torch.device):
     kwargs = dict(
@@ -63,7 +73,11 @@ def build_model(model_name: str, cfg: dict, device: torch.device):
         base_filters = cfg["model"]["base_filters"],
     )
     ds_flag = cfg["model"].get("deep_supervision", False)
-    if model_name in _FADC_PLACEMENT:
+    if model_name in _FADC_V2_PLACEMENT:
+        model = UNet3DFADC_V2(**kwargs,
+                              fadc_placement=_FADC_V2_PLACEMENT[model_name],
+                              deep_supervision=ds_flag).to(device)
+    elif model_name in _FADC_PLACEMENT:
         model = UNet3DFADC(**kwargs,
                            fadc_placement=_FADC_PLACEMENT[model_name],
                            deep_supervision=ds_flag).to(device)
@@ -147,7 +161,9 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--ckpt",       required=True, help="Path to best_model.pth")
     p.add_argument("--model",      required=True,
-                   choices=["unet3d"] + list(_FADC_PLACEMENT.keys()),
+                   choices=(["unet3d"]
+                            + list(_FADC_PLACEMENT.keys())
+                            + list(_FADC_V2_PLACEMENT.keys())),
                    help="Architecture (must match the checkpoint)")
     p.add_argument("--data_root",              required=True)
     p.add_argument("--preprocessed_cache_dir", required=True)
@@ -177,6 +193,15 @@ def main():
     # ── Load checkpoint ──
     ckpt = torch.load(args.ckpt, map_location=device)
     cfg  = ckpt["config"]
+    ckpt_model_name = ckpt.get("model_name")
+    if ckpt_model_name is not None and ckpt_model_name != args.model:
+        raise ValueError(
+            f"Checkpoint was trained as --model={ckpt_model_name!r} but you passed "
+            f"--model={args.model!r}. Aborting to avoid silent architecture mismatch."
+        )
+    if ckpt_model_name is None:
+        print("[warn] Checkpoint has no model_name stamped (older run) — "
+              "cannot verify --model matches; proceeding on user's word.")
     patch_size = tuple(cfg["data"]["patch_size"])
     print(f"Checkpoint       : {args.ckpt}")
     print(f"  best_dice (train val): {ckpt.get('best_dice', '?')}")
