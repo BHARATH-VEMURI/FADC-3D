@@ -126,6 +126,13 @@ class FrequencySelection3D(nn.Module):
         # small number of feature-map shapes a UNet sees per model.
         self._mask_cache: dict = {}
 
+        # Diagnostic cache — filled on every forward with the ACTUAL runtime
+        # band multipliers `2 * sigmoid(logits)` per band predictor. Detached
+        # so the diag reporter can read them without retaining a graph.
+        # List length matches len(k_list) + int(lowfreq_att); each entry has
+        # shape (B, spatial_group, D, H, W).
+        self.last_band_multipliers: list[torch.Tensor] = []
+
     # ---------------------------------------------------------------- helpers
     def _sp_act(self, logits: torch.Tensor) -> torch.Tensor:
         # sigmoid * 2 makes zero-logit init a true identity.
@@ -187,8 +194,8 @@ class FrequencySelection3D(nn.Module):
         masks = self._band_masks((d, h, w), x.device, x_f32.dtype)
 
         x_list: list[torch.Tensor] = []
+        band_muls: list[torch.Tensor] = []                                  # for diagnostics
         pre_x = x
-        prev_low = x  # for the first iteration
         for idx, mask in enumerate(masks):
             X_low = X * mask
             low_part = torch.fft.ifftn(
@@ -201,6 +208,7 @@ class FrequencySelection3D(nn.Module):
 
             fw_logits = self.freq_weight_conv_list[idx](att_feat)          # (B, sg, D, H, W)
             fw = self._sp_act(fw_logits)                                    # (B, sg, D, H, W)
+            band_muls.append(fw.detach())                                   # no graph retained
             # Broadcast fw across channels-per-group.
             tmp = fw.reshape(b, sg, 1, d, h, w) * high_part.reshape(b, sg, -1, d, h, w)
             x_list.append(tmp.reshape(b, c, d, h, w))
@@ -208,9 +216,14 @@ class FrequencySelection3D(nn.Module):
         if self.lowfreq_att:
             fw_logits = self.freq_weight_conv_list[len(self.k_list)](att_feat)
             fw = self._sp_act(fw_logits)
+            band_muls.append(fw.detach())                                   # no graph retained
             tmp = fw.reshape(b, sg, 1, d, h, w) * pre_x.reshape(b, sg, -1, d, h, w)
             x_list.append(tmp.reshape(b, c, d, h, w))
         else:
             x_list.append(pre_x)
+
+        # Publish the runtime multipliers for diagnostics AFTER the forward
+        # arithmetic is complete. Detached above, so no graph is retained.
+        self.last_band_multipliers = band_muls
 
         return sum(x_list)

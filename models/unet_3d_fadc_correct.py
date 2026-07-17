@@ -76,7 +76,11 @@ class FADCConvBlockCorrect(nn.Module):
 
 
 class PlainConvBlock(nn.Module):
-    """Standard double 3x3x3 Conv3d + BN + ReLU + residual (matches UNet3D style)."""
+    """Standard double 3x3x3 Conv3d + BN + ReLU (matches UNet3D style).
+
+    No residual connection — kept intentionally identical to the plain UNet3D
+    ConvBlock so encoder-vs-baseline comparisons stay on the same wiring.
+    """
 
     def __init__(self, in_ch: int, out_ch: int) -> None:
         super().__init__()

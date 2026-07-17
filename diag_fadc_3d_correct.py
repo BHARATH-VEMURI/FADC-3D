@@ -119,12 +119,23 @@ def report_layer(name: str, m: AdaptiveDilatedConv3D,
     kspat = k_att.flatten(2).std(dim=2, unbiased=False).mean().item()
     print(f"  k_att spatial-std   mean-over-branches = {kspat:.4f}")
 
-    # FreqSel band-weight stats (per predictor's raw logit before sigmoid*2)
+    # FreqSel — PRIMARY: actual runtime band multipliers 2*sigmoid(logits)
+    # captured during the last forward. Shape per band: (B, sg, D, H, W).
+    band_muls = getattr(m.fs, "last_band_multipliers", None) or []
+    if band_muls:
+        cutoffs = list(m.fs.k_list) + (["low"] if m.fs.lowfreq_att else [])
+        for i, mul in enumerate(band_muls):
+            mul_f = mul.detach().float()
+            tag = f"band[k={cutoffs[i]}]" if i < len(cutoffs) else f"band[{i}]"
+            print(f"  fs.{tag:<11s} mult  mean={mul_f.mean().item():+.4f} "
+                  f"std={mul_f.std(unbiased=False).item():.4f} "
+                  f"min={mul_f.min().item():+.4f} max={mul_f.max().item():+.4f}")
+    # SECONDARY: predictor parameter statistics (indirectly informative).
     for i, conv in enumerate(m.fs.freq_weight_conv_list):
         w = conv.weight.detach()
-        b = conv.bias.detach()
-        print(f"  fs.pred[{i}] W: mean={w.mean().item():+.4f} std={w.std().item():.4f} "
-              f"bias: mean={b.mean().item():+.4f}")
+        bb = conv.bias.detach()
+        print(f"  fs.pred[{i}]     W: mean={w.mean().item():+.4f} std={w.std().item():.4f} "
+              f"bias: mean={bb.mean().item():+.4f}")
 
     # c/f low/high multiplier statistics (per-batch std as an adaptivity proxy)
     for tag, t in [

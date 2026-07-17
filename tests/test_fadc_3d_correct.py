@@ -333,20 +333,39 @@ def test_17_amp():
               "AMP forward produced NaN/inf")
         return
 
+    # Real optimizer + real scaler.unscale_ so both the AMP forward AND the
+    # scaled-then-unscaled backward are exercised end-to-end.
     device = torch.device("cuda")
-    m = _module().to(device)
+    m = _module(use_s=True).to(device)
+    optimizer = torch.optim.AdamW(m.parameters(), lr=1e-4)
+    optimizer.zero_grad(set_to_none=True)
     scaler = GradScaler("cuda")
     x = torch.randn(2, 4, 8, 12, 12, device=device)
     with autocast("cuda"):
         y = m(x)
-        loss = y.pow(2).mean()
+        loss = y.float().pow(2).mean()
     scaler.scale(loss).backward()
-    scaler.unscale_(m.parameters().__next__().new_empty(0).new_zeros(1).new_full((), 1.0).new_empty(0).new_zeros(1).device)  # unused
-    # We only care that both forward and backward stay finite.
-    check(torch.isfinite(y).all() and torch.isfinite(m.weight.grad).all(),
-          "17_amp_cuda_finite",
-          "forward + weight.grad finite under AMP",
-          "AMP produced NaN/inf")
+    scaler.unscale_(optimizer)                       # unscale in-place
+
+    check(torch.isfinite(y).all(),
+          "17a_amp_forward_finite",
+          "AMP forward finite",
+          "AMP forward produced NaN/inf")
+    checked = [
+        ("weight",     m.weight),
+        ("c_low_fc",   m.ada_kern.c_low_fc.weight),
+        ("f_low_fc",   m.ada_kern.f_low_fc.weight),
+        ("c_high_fc",  m.ada_kern.c_high_fc.weight),
+        ("f_high_fc",  m.ada_kern.f_high_fc.weight),
+        ("s_fc",       m.ada_kern.s_fc.weight),
+        ("k_att_head", m.k_att.head.weight),
+    ]
+    for tag, p in checked:
+        g = p.grad
+        check(g is not None and torch.isfinite(g).all(),
+              f"17b_amp_unscaled_grad_finite_{tag}",
+              f"|g|={g.abs().sum().item():.3e}" if g is not None else "no grad",
+              f"{tag} grad missing or non-finite after unscale_")
 
 
 # ─────────────────────────── 18: checkpoint round-trip strict=True
