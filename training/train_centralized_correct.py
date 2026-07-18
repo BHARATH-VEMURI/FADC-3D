@@ -7,33 +7,22 @@ UNet3D training path — this is a fresh script bound to
 Overview
 --------
 - Segmentation loss only. Attention-diversity aux is disabled by default.
-- Validation is now split into a FAST proxy (overlap 0.0, run frequently) and a
-  FORMAL (overlap 0.5, run rarely or in a separate session).
-- Only formal validation updates `best_model.pth`. Fast validation writes to
-  `best_fast_model.pth` — clearly labelled as a proxy so it is never
-  compared with formal Dice.
+- One validation protocol: FORMAL. Every --val_every epochs, runs
+  sliding-window inference over ALL validation cases (306 in production) at
+  --val_overlap (default 0.5). No proxy / subset / low-overlap variant.
+- Only formal validation updates `best_model.pth`.
 - Every checkpoint (including `last_checkpoint.pth`) is written ATOMICALLY:
   temp file in the same dir, then `os.replace()`.
 - `last_checkpoint.pth` is saved BEFORE validation. If validation is
   interrupted, resume advances to the next epoch and never repeats work.
+  After validation, `last_checkpoint.pth` is rewritten with the newly
+  computed validation metrics folded into the log entry.
 - Checkpoints carry `epoch`, `model`, `optimizer`, `scheduler`, `scaler`,
-  `best_dice`, `best_fast_dice`, `arch_identity`, `config`, and the full
-  `train_log` accumulated so far.
+  `best_dice`, `arch_identity`, `config`, and the full `train_log`
+  accumulated so far.
 - Resume is backward compatible with older checkpoints that lack
-  `scaler` / `best_fast_dice` / `train_log`. It prints exactly what it
-  restored.
-
-Validation-schedule resolution
-------------------------------
-- `--fast_val_every N` (default 10)   : fast every N epochs.
-- `--fast_val_overlap O` (default 0.0)
-- `--fast_val_max_cases K` (default 0=all) : deterministic first-K cases when >0.
-- `--formal_val_every N` (default 0=off) : formal every N epochs, all 306 cases.
-- `--formal_val_overlap O` (default 0.5)
-- LEGACY: `--val_every` / `--val_overlap`. If either is given while the new
-  `--formal_val_every` is still at its default, the legacy pair maps to
-  FORMAL validation (this preserves prior notebook behaviour, which had
-  update-best semantics + overlap=0.5). Prints the resolved schedule.
+  `scaler` / `train_log`, and silently ignores any legacy `best_fast_dice`
+  field.
 
 Deep-supervision inference
 --------------------------
@@ -117,29 +106,17 @@ def parse_args():
     # AdaKern / FreqSel toggles
     p.add_argument("--use_position_att", action="store_true")
 
-    # ---- FAST / FORMAL validation -----------------------------------------
-    p.add_argument("--fast_val_every", type=int, default=10,
-                   help="Fast/proxy validation cadence in epochs. 0 disables.")
-    p.add_argument("--fast_val_overlap", type=float, default=0.0,
-                   help="Sliding-window overlap for FAST validation. Default 0.0.")
-    p.add_argument("--fast_val_max_cases", type=int, default=0,
-                   help="If > 0, use only the first K validation cases (deterministic subset).")
-    p.add_argument("--formal_val_every", type=int, default=0,
-                   help="Formal validation cadence. 0 disables formal validation during training.")
-    p.add_argument("--formal_val_overlap", type=float, default=0.5,
-                   help="Sliding-window overlap for FORMAL validation. Default 0.5.")
+    # ---- FORMAL validation (single protocol) ------------------------------
+    p.add_argument("--val_every", type=int, default=20,
+                   help="Formal validation cadence in epochs. Uses ALL "
+                        "validation cases at --val_overlap.")
+    p.add_argument("--val_overlap", type=float, default=0.5,
+                   help="Sliding-window overlap for formal validation. Default 0.5.")
     p.add_argument("--val_sw_batch_size", type=int, default=4,
-                   help="sw_batch_size for sliding-window inference (both fast and formal).")
+                   help="sw_batch_size for sliding-window inference.")
     p.add_argument("--checkpoint_every", type=int, default=10,
-                   help="Extra periodic snapshot cadence (also always saved every epoch).")
-
-    # ---- LEGACY validation args (kept for backward compat) ----------------
-    p.add_argument("--val_every", type=int, default=None,
-                   help="LEGACY. If given while --formal_val_every is at default (0), "
-                        "maps to --formal_val_every (formal semantics with best-update).")
-    p.add_argument("--val_overlap", type=float, default=None,
-                   help="LEGACY. Overlap for the legacy --val_every path. "
-                        "When mapped to formal, overrides --formal_val_overlap.")
+                   help="Extra periodic named-snapshot cadence "
+                        "(last_checkpoint.pth is always saved every epoch regardless).")
 
     return p.parse_args()
 
@@ -205,45 +182,27 @@ def _iou_sens_per_case(pred_fg: torch.Tensor, label_fg: torch.Tensor) -> tuple[f
     return iou, sens
 
 
-def limit_val_iterable(val_loader, max_cases: int):
-    """Return an iterable over the first `max_cases` batches when max_cases > 0.
-
-    `val_loader` is built with `shuffle=False` and `batch_size=1`, so iterating
-    in order and taking the first K gives a deterministic subset that stays
-    identical across epochs and resumes.
-    """
-    if max_cases and max_cases > 0:
-        import itertools
-        return itertools.islice(val_loader, max_cases)
-    return val_loader
-
-
 def validate(model, val_loader, dice_metric, post_pred, post_label,
              patch_size, device,
-             overlap: float, sw_batch_size: int,
-             max_cases: int = 0, label: str = "validation") -> tuple[float, float, float, int]:
-    """Sliding-window validation with per-case tqdm.
+             overlap: float, sw_batch_size: int) -> tuple[float, float, float, int]:
+    """Sliding-window formal validation over the ENTIRE val loader.
 
-    Returns (mean_dice, mean_iou, mean_sensitivity, n_cases_evaluated).
+    Iterates every case in `val_loader` — no subset, no proxy. Returns
+    (mean_dice, mean_iou, mean_sensitivity, n_cases_evaluated).
     """
     model.eval()
     dice_metric.reset()
     iou_list, sens_list = [], []
 
-    total = None
     try:
         total = len(val_loader)
     except TypeError:
         total = None
-    if max_cases and max_cases > 0:
-        total = min(total or max_cases, max_cases)
 
-    iterable = limit_val_iterable(val_loader, max_cases)
-
-    # Wrap once — sliding-window sees only the primary head under DS.
     predictor = make_primary_predictor(model)
 
-    pbar = tqdm(iterable, total=total, desc=label, unit="case",
+    pbar = tqdm(val_loader, total=total,
+                desc="Formal validation", unit="case",
                 file=sys.stdout, dynamic_ncols=False, ncols=100,
                 mininterval=1.0, leave=False)
 
@@ -456,63 +415,6 @@ def atomic_json_write(obj, dest: os.PathLike) -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# VALIDATION SCHEDULE RESOLUTION
-# ═══════════════════════════════════════════════════════════════════════
-
-def resolve_val_schedule(args) -> dict:
-    """Resolve the fast/formal validation schedule from args, applying the
-    legacy-CLI mapping. Returns a plain dict; prints the resolved schedule.
-
-    Rule:
-      1. Start from the new args (fast_val_*, formal_val_*).
-      2. If `--val_every` was passed AND `--formal_val_every` is still at its
-         default 0, promote the legacy pair to FORMAL:
-            formal_val_every = args.val_every
-            formal_val_overlap = args.val_overlap or 0.5
-      3. If both legacy and new-formal are given, refuse ambiguously.
-    """
-    fast_every  = int(args.fast_val_every)
-    fast_over   = float(args.fast_val_overlap)
-    fast_max    = int(args.fast_val_max_cases)
-    form_every  = int(args.formal_val_every)
-    form_over   = float(args.formal_val_overlap)
-
-    legacy_every = args.val_every
-    legacy_over  = args.val_overlap
-    if legacy_every is not None:
-        if form_every != 0:
-            raise SystemExit(
-                "Both --val_every (legacy) and --formal_val_every were specified; "
-                "this is ambiguous. Pass only one."
-            )
-        form_every = int(legacy_every)
-        if legacy_over is not None:
-            form_over = float(legacy_over)
-        # If someone still relied on the old default overlap 0.5, form_over
-        # remains at the fresh default 0.5 — matches previous behaviour.
-
-    schedule = {
-        "fast_val_every":     fast_every,
-        "fast_val_overlap":   fast_over,
-        "fast_val_max_cases": fast_max,
-        "formal_val_every":   form_every,
-        "formal_val_overlap": form_over,
-        "val_sw_batch_size":  int(args.val_sw_batch_size),
-        "checkpoint_every":   int(args.checkpoint_every),
-    }
-    print("Resolved validation schedule:")
-    print(f"  FAST   every {fast_every} ep  overlap {fast_over}  "
-          f"max_cases {'ALL' if fast_max == 0 else fast_max}  (proxy — updates best_fast_model.pth only)")
-    print(f"  FORMAL every {form_every} ep  overlap {form_over}  "
-          f"max_cases ALL  (updates best_model.pth)")
-    print(f"  sw_batch_size {schedule['val_sw_batch_size']}   "
-          f"checkpoint_every {schedule['checkpoint_every']}")
-    if fast_every <= 0 and form_every <= 0:
-        print("  NOTE: both fast and formal validation are DISABLED — training only.")
-    return schedule
-
-
-# ═══════════════════════════════════════════════════════════════════════
 # TRAIN
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -540,7 +442,20 @@ def train(cfg, args):
     cache_rate = cfg["data"]["cache_rate"]
     num_workers = cfg["data"]["num_workers"]
 
-    schedule = resolve_val_schedule(args)
+    val_config = {
+        "val_every":         int(args.val_every),
+        "val_overlap":       float(args.val_overlap),
+        "val_sw_batch_size": int(args.val_sw_batch_size),
+        "checkpoint_every":  int(args.checkpoint_every),
+    }
+    print("Validation schedule (formal only):")
+    print(f"  every {val_config['val_every']} ep  overlap {val_config['val_overlap']}  "
+          f"all cases  sw_batch_size {val_config['val_sw_batch_size']}  "
+          f"(updates best_model.pth)")
+    print(f"  checkpoint_every {val_config['checkpoint_every']} ep "
+          f"(last_checkpoint.pth is written every epoch regardless)")
+    if val_config['val_every'] <= 0:
+        print("  NOTE: validation is DISABLED — training only.")
 
     split_csv = os.path.join(args.data_root, "train_test_splits.csv")
     if not os.path.exists(split_csv):
@@ -552,11 +467,9 @@ def train(cfg, args):
         epochs = 2
         cache_rate = 0.0
         num_workers = 0
-        # Force a fast val each epoch in smoke, formal off.
-        schedule["fast_val_every"] = 1
-        schedule["fast_val_max_cases"] = 0
-        schedule["formal_val_every"] = 0
-        schedule["checkpoint_every"] = 1
+        # Force formal validation each epoch in smoke.
+        val_config["val_every"] = 1
+        val_config["checkpoint_every"] = 1
 
     train_loader, val_loader = build_centralized_loaders(
         data_root=args.data_root,
@@ -623,7 +536,6 @@ def train(cfg, args):
 
     start_epoch = 0
     best_dice = 0.0       # FORMAL only
-    best_fast_dice = 0.0  # PROXY only
     train_log: list = []
 
     fadc_extras = {"use_position_att": bool(args.use_position_att)}
@@ -648,18 +560,28 @@ def train(cfg, args):
                 print(f"  WARN: scaler state present but load failed ({e}); using fresh scaler.")
         else:
             restored.append("scaler=(legacy ckpt; fresh)")
-        start_epoch = int(ckpt["epoch"]) + 1
+        completed_epoch = int(ckpt["epoch"])
+        start_epoch = completed_epoch + 1
         best_dice = float(ckpt.get("best_dice", 0.0))
-        best_fast_dice = float(ckpt.get("best_fast_dice", 0.0))
         if "train_log" in ckpt and isinstance(ckpt["train_log"], list):
             train_log = list(ckpt["train_log"])
             restored.append(f"train_log ({len(train_log)} entries)")
         else:
             restored.append("train_log=(legacy ckpt; empty)")
+        if "best_fast_dice" in ckpt:
+            # Legacy field from the deprecated fast-validation system — ignored.
+            restored.append("best_fast_dice=(legacy; ignored)")
+
+        # Temperature the next epoch will train at (mirrors the top of the loop).
+        t_next = k_att_temperature(start_epoch, args.k_att_anneal_epochs,
+                                   args.k_att_temp_start, args.k_att_temp_end)
+        lr_now = scheduler.get_last_lr()[0]
         print(f"Resumed from checkpoint: {args.resume}")
-        print(f"  start_epoch      = {start_epoch}")
+        print(f"  completed epoch  = {completed_epoch}")
+        print(f"  next epoch       = {start_epoch}")
         print(f"  best_dice(formal)= {best_dice:.4f}")
-        print(f"  best_fast_dice   = {best_fast_dice:.4f}")
+        print(f"  scheduler LR now = {lr_now:.2e}")
+        print(f"  k_att T at next  = {t_next:.4f}")
         print(f"  restored         : {', '.join(restored)}")
 
     print(f"\nStarting training: {epochs} epochs | LR {lr} | Batch {batch_size}")
@@ -674,11 +596,10 @@ def train(cfg, args):
             "scheduler":      scheduler.state_dict(),
             "scaler":         scaler.state_dict(),
             "best_dice":      float(best_dice),
-            "best_fast_dice": float(best_fast_dice),
             "config":         cfg,
             "model_name":     args.model,
             "arch_identity":  arch_id,
-            "schedule":       schedule,
+            "val_config":     val_config,
             "train_log":      list(train_log),
         }
 
@@ -760,56 +681,33 @@ def train(cfg, args):
         atomic_torch_save(build_ckpt_dict(epoch_completed=epoch), output_dir / "last_checkpoint.pth")
         atomic_json_write(train_log, output_dir / "train_log.json")
 
-        # ─── FAST (proxy) VALIDATION ───
-        if schedule["fast_val_every"] > 0 and (epoch + 1) % schedule["fast_val_every"] == 0:
-            print("\n---- FAST/PROXY VALIDATION - not the formal final metric ----")
-            fdice, fiou, fsens, n = validate(
-                model, val_loader, dice_metric, post_pred, post_label,
-                patch_size, device,
-                overlap=schedule["fast_val_overlap"],
-                sw_batch_size=schedule["val_sw_batch_size"],
-                max_cases=schedule["fast_val_max_cases"],
-                label=f"FAST val (overlap={schedule['fast_val_overlap']}, n={{}})".format(
-                    'ALL' if schedule['fast_val_max_cases']==0 else schedule['fast_val_max_cases']),
-            )
-            marker = " <-- NEW BEST FAST (proxy)" if fdice > best_fast_dice else ""
-            print(f"  FAST  Dice {fdice:.4f} | IoU {fiou:.4f} | Sens {fsens:.4f} "
-                  f"| n={n}  (best_fast {best_fast_dice:.4f}){marker}")
-            log_entry["fast_val_dice"] = fdice
-            log_entry["fast_val_iou"] = fiou
-            log_entry["fast_val_sensitivity"] = fsens
-            log_entry["fast_val_n_cases"] = n
-            log_entry["fast_val_overlap"] = schedule["fast_val_overlap"]
-            if fdice > best_fast_dice:
-                best_fast_dice = fdice
-                atomic_torch_save(build_ckpt_dict(epoch_completed=epoch),
-                                  output_dir / "best_fast_model.pth")
-                print(f"  proxy checkpoint -> {output_dir}/best_fast_model.pth")
-
         # ─── FORMAL VALIDATION ───
-        if schedule["formal_val_every"] > 0 and (epoch + 1) % schedule["formal_val_every"] == 0:
-            print("\n==== FORMAL FULL VALIDATION ====")
-            fmt_dice, fmt_iou, fmt_sens, n = validate(
+        if val_config["val_every"] > 0 and (epoch + 1) % val_config["val_every"] == 0:
+            try:
+                n_val = len(val_loader)
+            except TypeError:
+                n_val = "?"
+            print(f"\n==== FORMAL FULL VALIDATION: {n_val} cases, "
+                  f"overlap={val_config['val_overlap']} ====")
+            v_dice, v_iou, v_sens, n = validate(
                 model, val_loader, dice_metric, post_pred, post_label,
                 patch_size, device,
-                overlap=schedule["formal_val_overlap"],
-                sw_batch_size=schedule["val_sw_batch_size"],
-                max_cases=0,      # formal always uses all
-                label=f"FORMAL val (overlap={schedule['formal_val_overlap']})",
+                overlap=val_config["val_overlap"],
+                sw_batch_size=val_config["val_sw_batch_size"],
             )
-            marker = " <-- NEW BEST FORMAL" if fmt_dice > best_dice else ""
-            print(f"  FORMAL Dice {fmt_dice:.4f} | IoU {fmt_iou:.4f} | Sens {fmt_sens:.4f} "
-                  f"| n={n}  (best_formal {best_dice:.4f}){marker}")
-            log_entry["formal_val_dice"] = fmt_dice
-            log_entry["formal_val_iou"] = fmt_iou
-            log_entry["formal_val_sensitivity"] = fmt_sens
-            log_entry["formal_val_n_cases"] = n
-            log_entry["formal_val_overlap"] = schedule["formal_val_overlap"]
-            if fmt_dice > best_dice:
-                best_dice = fmt_dice
+            marker = " <-- NEW BEST" if v_dice > best_dice else ""
+            print(f"  FORMAL Dice {v_dice:.4f} | IoU {v_iou:.4f} | Sens {v_sens:.4f} "
+                  f"| n={n}  (best {best_dice:.4f}){marker}")
+            log_entry["val_dice"] = v_dice
+            log_entry["val_iou"] = v_iou
+            log_entry["val_sensitivity"] = v_sens
+            log_entry["val_n_cases"] = n
+            log_entry["val_overlap"] = val_config["val_overlap"]
+            if v_dice > best_dice:
+                best_dice = v_dice
                 atomic_torch_save(build_ckpt_dict(epoch_completed=epoch),
                                   output_dir / "best_model.pth")
-                print(f"  formal best -> {output_dir}/best_model.pth")
+                print(f"  best -> {output_dir}/best_model.pth")
 
         # ─── POST-VALIDATION CHECKPOINT ───
         # Rewrite last_checkpoint with the validation-augmented log entry.
@@ -817,7 +715,7 @@ def train(cfg, args):
         atomic_json_write(train_log, output_dir / "train_log.json")
 
         # Periodic named snapshot (in addition to last_checkpoint).
-        if schedule["checkpoint_every"] > 0 and (epoch + 1) % schedule["checkpoint_every"] == 0:
+        if val_config["checkpoint_every"] > 0 and (epoch + 1) % val_config["checkpoint_every"] == 0:
             atomic_torch_save(build_ckpt_dict(epoch_completed=epoch),
                               output_dir / f"checkpoint_epoch{epoch+1:03d}.pth")
 
@@ -830,14 +728,12 @@ def train(cfg, args):
         "k_att_temp_start": args.k_att_temp_start,
         "k_att_temp_end": args.k_att_temp_end,
         "k_att_anneal_epochs": args.k_att_anneal_epochs,
-        "schedule": schedule,
-        "best_dice_formal": best_dice,
-        "best_fast_dice": best_fast_dice,
+        "val_config": val_config,
+        "best_dice": best_dice,
         "epochs": epochs,
     }, output_dir / "meta.json")
 
-    print(f"\nTraining complete. Best FORMAL Val Dice: {best_dice:.4f}   "
-          f"Best FAST/proxy Dice: {best_fast_dice:.4f}")
+    print(f"\nTraining complete. Best FORMAL Val Dice: {best_dice:.4f}")
     print(f"Outputs saved to: {output_dir}")
 
 
