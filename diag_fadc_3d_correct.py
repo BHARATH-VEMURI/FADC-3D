@@ -17,11 +17,25 @@ proxy `|x - avg_pool3d(x)|`. A negative correlation (high-freq -> small dil)
 is the expected tendency; treat this only as a diagnostic hint, not a training
 target.
 
-Usage:
+Usage (legacy, physical-directory mode — kept for backward compatibility):
     python diag_fadc_3d_correct.py \
         --ckpt path/to/best_model.pth \
         --preprocessed_cache path/to/val/*.npz \
         --n_patches 4 --patch_size 96 96 48
+
+Usage (manifest mode — REQUIRED for the 70/10/20 experiments, since the
+old train/ and val/ physical dirs mix logical partitions):
+    python diag_fadc_3d_correct.py \
+        --ckpt path/to/best_model.pth \
+        --split_manifest path/to/split_70_10_20_seed42.csv \
+        --split_partition val \
+        --preprocessed_cache_dir path/to/cache_root \
+        --n_patches 4 --patch_size 96 96 48
+
+In manifest mode the diagnostic ONLY reads .npz files whose patient_id
+belongs to the requested logical partition — the physical directory is
+never scanned. This prevents test-set leakage when val and test patients
+share the same on-disk folder.
 """
 from __future__ import annotations
 
@@ -45,36 +59,60 @@ from fadc_3d_correct.freq_select_3d import FrequencySelection3D
 
 # ─────────────────────────── data helpers
 
+def _extract_patch(img: np.ndarray, patch_size: tuple[int, int, int],
+                   rng: np.random.Generator) -> np.ndarray:
+    """Deterministic-under-`rng` random crop with zero-padding for undersized volumes."""
+    c, D, H, W = img.shape
+    pd, ph, pw = patch_size
+    d0 = rng.integers(0, max(1, D - pd + 1))
+    h0 = rng.integers(0, max(1, H - ph + 1))
+    w0 = rng.integers(0, max(1, W - pw + 1))
+    patch = img[:, d0:d0 + pd, h0:h0 + ph, w0:w0 + pw]
+    pad = [(0, 0)] + [
+        (0, max(0, pd - patch.shape[1])),
+        (0, max(0, ph - patch.shape[2])),
+        (0, max(0, pw - patch.shape[3])),
+    ]
+    patch = np.pad(patch, pad, mode="constant")
+    return patch[:, :pd, :ph, :pw]
+
+
 def _load_random_val_patches(cache_dir: str, n_patches: int,
                               patch_size: tuple[int, int, int]) -> torch.Tensor:
-    """Load N random patches from the preprocessed val cache."""
+    """LEGACY: load N random patches by scanning a physical directory.
+
+    Kept for backward compatibility with runs that don't use a split manifest.
+    Not safe for the 70/10/20 experiments where the physical folder mixes
+    train/val/test — use `_load_patches_from_paths` via manifest mode.
+    """
     cache = Path(cache_dir)
     npzs = sorted(cache.glob("*.npz"))
     if not npzs:
         raise FileNotFoundError(f"No .npz files found under {cache}")
     rng = np.random.default_rng(0)
     picks = rng.choice(len(npzs), size=min(n_patches, len(npzs)), replace=False)
-    xs = []
-    for i in picks:
-        d = np.load(npzs[i])
-        img = d["image"].astype(np.float32)               # (C, D, H, W)
-        c, D, H, W = img.shape
-        pd, ph, pw = patch_size
-        # crop a random valid corner
-        d0 = rng.integers(0, max(1, D - pd + 1))
-        h0 = rng.integers(0, max(1, H - ph + 1))
-        w0 = rng.integers(0, max(1, W - pw + 1))
-        patch = img[:, d0:d0 + pd, h0:h0 + ph, w0:w0 + pw]
-        # pad if smaller
-        pad = [(0, 0)] + [
-            (0, max(0, pd - patch.shape[1])),
-            (0, max(0, ph - patch.shape[2])),
-            (0, max(0, pw - patch.shape[3])),
-        ]
-        patch = np.pad(patch, pad, mode="constant")
-        patch = patch[:, :pd, :ph, :pw]
-        xs.append(patch)
-    return torch.from_numpy(np.stack(xs, axis=0))  # (B, C, D, H, W)
+    xs = [_extract_patch(np.load(npzs[i])["image"].astype(np.float32),
+                         patch_size, rng) for i in picks]
+    return torch.from_numpy(np.stack(xs, axis=0))
+
+
+def _load_patches_from_paths(paths: list[str], n_patches: int,
+                              patch_size: tuple[int, int, int]
+                              ) -> tuple[torch.Tensor, list[int]]:
+    """Deterministic-seed-0 selection of `n_patches` files from an explicit list.
+
+    Returns (tensor, indices_into_paths). Never touches the filesystem
+    outside `paths`. Used by the manifest-restricted diagnostic mode.
+    """
+    if not paths:
+        raise FileNotFoundError("Empty paths list passed to _load_patches_from_paths.")
+    rng = np.random.default_rng(0)
+    picks = rng.choice(len(paths), size=min(n_patches, len(paths)),
+                       replace=False)
+    picks = sorted(int(i) for i in picks)  # stable order for logging
+    xs = [_extract_patch(np.load(paths[i])["image"].astype(np.float32),
+                         patch_size, rng) for i in picks]
+    return torch.from_numpy(np.stack(xs, axis=0)), picks
 
 
 # ─────────────────────────── local high-freq energy
@@ -214,14 +252,89 @@ def diag(args) -> None:
         print(f"loaded {model_name} epoch={ckpt.get('epoch')} best_dice={ckpt.get('best_dice')}")
 
     # Load real MRI patches.
-    if args.preprocessed_cache:
+    if args.split_manifest:
+        # ── MANIFEST-RESTRICTED MODE ─────────────────────────────────────
+        # Loads only .npz files whose patient_id belongs to the requested
+        # partition. Never scans the physical directory. This is the
+        # required mode for the 70/10/20 experiments (val + test share
+        # physical folders after re-partitioning).
+        if not args.preprocessed_cache_dir:
+            raise SystemExit(
+                "diag: --split_manifest requires --preprocessed_cache_dir "
+                "(cache root that the manifest's relative_npz_path is resolved against)."
+            )
+        # Deferred import — split_manifest lives under training/ which is
+        # only importable when the repo root is on sys.path (done above).
+        from training.split_manifest import (
+            load_manifest, manifest_sha256, verify_manifest_partitions,
+        )
+        # Sanity: manifest CSV integrity + partition coverage.
+        _ = verify_manifest_partitions(args.split_manifest)
+        selected_cases = load_manifest(args.split_manifest,
+                                       split=args.split_partition,
+                                       cache_root=args.preprocessed_cache_dir,
+                                       require_exists=True)
+        if not selected_cases:
+            raise SystemExit(
+                f"diag: manifest partition {args.split_partition!r} is empty "
+                f"under {args.split_manifest!r}."
+            )
+        # Defence-in-depth: assert every loaded case belongs to the
+        # requested partition. load_manifest already filters by split,
+        # but re-check via the full manifest so a stale csv can't slip
+        # a wrong-partition case through.
+        import csv as _csv
+        _all_by_pid = {}
+        with open(args.split_manifest, "r", encoding="utf-8", newline="") as _f:
+            for row in _csv.DictReader(_f):
+                _all_by_pid[row["patient_id"]] = row["split"]
+        for c in selected_cases:
+            assigned = _all_by_pid.get(c["patient_id"])
+            if assigned != args.split_partition:
+                raise SystemExit(
+                    f"diag: patient {c['patient_id']!r} claimed by loader as "
+                    f"partition={args.split_partition!r} but manifest says {assigned!r}. "
+                    "Refusing — this would leak a wrong-partition case."
+                )
+        # Choose the diagnostic subset deterministically under seed 0.
+        paths_all = [c["npz_path"] for c in selected_cases]
+        x, picks = _load_patches_from_paths(
+            paths_all, n_patches=args.n_patches,
+            patch_size=tuple(args.patch_size),
+        )
+        x = x.to(device)
+        chosen = [selected_cases[i] for i in picks]
+
+        # Final leakage guard on the actually-loaded subset.
+        chosen_pids = {c["patient_id"] for c in chosen}
+        for pid in chosen_pids:
+            if _all_by_pid.get(pid) != args.split_partition:
+                raise SystemExit(
+                    f"diag: post-selection leakage — {pid!r} is not in the "
+                    f"{args.split_partition!r} partition."
+                )
+
+        _mani_sha = manifest_sha256(args.split_manifest)
+        print(f"manifest      : {args.split_manifest}")
+        print(f"manifest SHA  : {_mani_sha}")
+        print(f"partition     : {args.split_partition}  (n_in_partition={len(selected_cases)})")
+        print(f"selected      : {len(chosen)} case(s), seed=0")
+        for c in chosen:
+            print(f"  - patient_id={c['patient_id']:20s}  "
+                  f"collection={c['collection']:6s}  npz={c['npz_path']}")
+        print(f"patch tensor  : shape={tuple(x.shape)}")
+    elif args.preprocessed_cache:
+        # ── LEGACY MODE (backward-compat) ────────────────────────────────
+        print("WARNING: legacy directory-scan mode. This is UNSAFE for the "
+              "70/10/20 experiments — use --split_manifest instead.")
         x = _load_random_val_patches(
             args.preprocessed_cache, n_patches=args.n_patches,
             patch_size=tuple(args.patch_size),
         ).to(device)
         print(f"patches from {args.preprocessed_cache}: shape={tuple(x.shape)}")
     else:
-        print("WARNING: --preprocessed_cache not provided; falling back to random noise.")
+        print("WARNING: neither --split_manifest nor --preprocessed_cache "
+              "provided; falling back to random noise.")
         x = torch.randn(args.n_patches, 2, *args.patch_size, device=device)
 
     hf_e = high_freq_energy(x).detach()
@@ -273,12 +386,27 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--ckpt", type=str, default=None)
     p.add_argument("--preprocessed_cache", type=str, default=None,
-                   help="Directory of val .npz patches to draw real-MRI inputs from.")
+                   help="LEGACY. Directory of .npz patches to draw real-MRI inputs from. "
+                        "UNSAFE for 70/10/20 experiments — use --split_manifest instead.")
     p.add_argument("--n_patches", type=int, default=4)
     p.add_argument("--patch_size", type=int, nargs=3, default=[96, 96, 48])
     p.add_argument("--in_channels", type=int, default=2)
     p.add_argument("--out_channels", type=int, default=2)
     p.add_argument("--base_filters", type=int, default=32)
+
+    # ── Manifest-restricted mode (preferred for split-manifest experiments) ──
+    p.add_argument("--split_manifest", type=str, default=None,
+                   help="Path to a CSV manifest produced by training/split_manifest.py. "
+                        "When set, the diagnostic reads ONLY .npz files whose patient_id "
+                        "belongs to --split_partition; the physical folder is never scanned.")
+    p.add_argument("--split_partition", type=str, default="val",
+                   choices=("train", "val", "test"),
+                   help="Which manifest partition to draw diagnostic patches from. "
+                        "Default 'val'.  For DS/nods 70/10/20 experiments always use 'val'; "
+                        "'test' is reserved for the locked final-test evaluator.")
+    p.add_argument("--preprocessed_cache_dir", type=str, default=None,
+                   help="Cache root that --split_manifest's relative_npz_path values are "
+                        "resolved against. Required when --split_manifest is set.")
     return p.parse_args()
 
 
