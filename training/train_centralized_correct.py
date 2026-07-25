@@ -85,6 +85,16 @@ def parse_args():
     p.add_argument("--preprocessed_cache_dir", type=str, default=None)
     p.add_argument("--resume", type=str, default=None,
                    help="Path to a checkpoint to resume from. Refuses architecture mismatch.")
+    p.add_argument("--split_manifest", type=str, default=None,
+                   help="Path to a CSV manifest produced by training/split_manifest.py. "
+                        "When set, patient partitioning comes from the manifest and the "
+                        "old preprocessed_cache_dir/{train,val} subdir enumeration is bypassed. "
+                        "--preprocessed_cache_dir is still required as the base for "
+                        "relative_npz_path resolution.")
+    p.add_argument("--split_partition_train", type=str, default="train",
+                   help="Which manifest partition supplies the training loader. Default 'train'.")
+    p.add_argument("--split_partition_val", type=str, default="val",
+                   help="Which manifest partition supplies the validation loader. Default 'val'.")
     p.add_argument("--smoke_test", action="store_true",
                    help="2 epochs on 4 cases — verifies the end-to-end pipeline.")
     p.add_argument("--model", type=str, default="unet3d_fadc_encoder_correct",
@@ -320,6 +330,29 @@ def _require_matching_arch(ckpt: dict, current: dict) -> None:
         )
 
 
+def _require_matching_split(ckpt: dict, current: dict) -> None:
+    """Refuse to resume across a manifest change.
+
+    Compares (split_manifest_sha256, split_partition_train, split_partition_val,
+    split_seed) on the checkpoint against the current run. A checkpoint that
+    trained on no manifest cannot be resumed under a manifest, and vice versa.
+    Purely additive — legacy resumes that predate the manifest field skip
+    silently because both sides carry None.
+    """
+    ckpt_split = ckpt.get("split_identity", {}) or {}
+    cur_split = current or {}
+    # If both are wholly None (legacy on both sides), let resume proceed.
+    if not any(ckpt_split.values()) and not any(cur_split.values()):
+        return
+    for key in ("split_manifest_sha256", "split_partition_train",
+                "split_partition_val", "split_seed"):
+        if ckpt_split.get(key) != cur_split.get(key):
+            raise RuntimeError(
+                f"Refusing to resume: split identity mismatch on '{key}': "
+                f"ckpt={ckpt_split.get(key)}  current={cur_split.get(key)}"
+            )
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # MECHANISM STATS (unchanged)
 # ═══════════════════════════════════════════════════════════════════════
@@ -471,6 +504,14 @@ def train(cfg, args):
         val_config["val_every"] = 1
         val_config["checkpoint_every"] = 1
 
+    # Manifest short-circuits the legacy split_csv path. Refuse to fall
+    # back to train_test_splits.csv when a manifest is explicitly requested.
+    split_manifest_arg = args.split_manifest or ""
+    if split_manifest_arg:
+        if not os.path.exists(split_manifest_arg):
+            raise SystemExit(f"--split_manifest not found: {split_manifest_arg}")
+        split_csv = None  # never mix manifest + legacy split_csv
+
     train_loader, val_loader = build_centralized_loaders(
         data_root=args.data_root,
         split_csv=split_csv,
@@ -482,6 +523,9 @@ def train(cfg, args):
         preprocessed_cache_dir=args.preprocessed_cache_dir or "",
         patch_size=patch_size,
         seed=args.seed,
+        split_manifest=split_manifest_arg,
+        split_train=args.split_partition_train,
+        split_val=args.split_partition_val,
     )
 
     model_kwargs = dict(
@@ -541,10 +585,40 @@ def train(cfg, args):
     fadc_extras = {"use_position_att": bool(args.use_position_att)}
     arch_id = _arch_identity(args.model, cfg["model"], fadc_extras)
 
+    # Manifest identity: burn the CSV SHA256, split partitions and (if we
+    # can derive it) ratios/seed into every checkpoint. Downstream resumes
+    # and final-test evaluators refuse mismatched manifests. All fields
+    # None-safe when no manifest is used, so legacy training paths are
+    # unaffected.
+    split_identity: dict = {
+        "split_manifest_path":   os.path.abspath(split_manifest_arg) if split_manifest_arg else None,
+        "split_manifest_sha256": None,
+        "split_partition_train": args.split_partition_train if split_manifest_arg else None,
+        "split_partition_val":   args.split_partition_val if split_manifest_arg else None,
+        "split_seed":            None,
+        "split_ratios":          None,
+    }
+    if split_manifest_arg:
+        from training.split_manifest import manifest_sha256
+        split_identity["split_manifest_sha256"] = manifest_sha256(split_manifest_arg)
+        # Best-effort read of the companion meta.json (same basename with
+        # _metadata.json suffix); tolerate absence.
+        _meta_guess = os.path.splitext(split_manifest_arg)[0] + "_metadata.json"
+        if os.path.exists(_meta_guess):
+            try:
+                with open(_meta_guess, "r", encoding="utf-8") as _f:
+                    _meta = json.load(_f)
+                split_identity["split_seed"]   = _meta.get("seed")
+                split_identity["split_ratios"] = _meta.get("ratios")
+            except Exception:
+                pass  # metadata is a convenience; the checksum is authoritative.
+    print(f"split_identity : {split_identity}")
+
     # ─────────────────────────── RESUME
     if args.resume and os.path.exists(args.resume):
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
         _require_matching_arch(ckpt, arch_id)
+        _require_matching_split(ckpt, split_identity)
         restored = []
         model.load_state_dict(ckpt["model"], strict=True)
         restored.append("model (strict)")
@@ -599,6 +673,7 @@ def train(cfg, args):
             "config":         cfg,
             "model_name":     args.model,
             "arch_identity":  arch_id,
+            "split_identity": dict(split_identity),
             "val_config":     val_config,
             "train_log":      list(train_log),
         }

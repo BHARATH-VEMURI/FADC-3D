@@ -296,8 +296,17 @@ class PreprocessedDataset(Dataset):
         return len(self.cases)
 
     def __getitem__(self, idx):
-        patient_id = self.cases[idx]["patient_id"]
-        npz_path   = self.cache_dir / f"{patient_id}.npz"
+        case = self.cases[idx]
+        patient_id = case["patient_id"]
+        # Prefer an explicit path from the case dict (manifest-driven loading)
+        # so patients coming from different physical subdirs of a read-only
+        # Kaggle input mount can be pooled into one logical split without
+        # copying files. Falls back to the legacy single-cache-dir layout so
+        # older callers keep working unchanged.
+        if "npz_path" in case and case["npz_path"]:
+            npz_path = Path(case["npz_path"])
+        else:
+            npz_path = self.cache_dir / f"{patient_id}.npz"
 
         try:
             data_npz = np.load(npz_path)
@@ -307,6 +316,15 @@ class PreprocessedDataset(Dataset):
             }
             if self.transform is not None:
                 item = self.transform(item)
+            else:
+                # Validation / test path — attach the case identity so the
+                # evaluator can emit per-collection metrics. The training
+                # path deliberately skips this because RandCrop drops
+                # unknown keys anyway.
+                if "collection" in case:
+                    item["collection"] = case["collection"]
+                if "patient_id" in case:
+                    item["patient_id"] = case["patient_id"]
             return item
         except Exception as e:
             # Cases discovered from the cache don't carry raw NIfTI paths, so we can't
@@ -350,6 +368,9 @@ def build_centralized_loaders(
     preprocessed_cache_dir: str = "",
     patch_size=None,
     seed: int = None,
+    split_manifest: str = "",
+    split_train: str = "train",
+    split_val: str = "val",
 ):
     """
     Returns (train_loader, val_loader) using all collections combined.
@@ -359,8 +380,41 @@ def build_centralized_loaders(
       Expected layout: <cache_dir>/train/{patient_id}.npz, <cache_dir>/val/{patient_id}.npz
     persistent_cache_dir: MONAI PersistentDataset cache (preprocess once to disk per session).
     cache_rate=0.0: no caching — slowest but works anywhere.
+
+    split_manifest: absolute path to a split-manifest CSV produced by
+      training/split_manifest.py. When set, `preprocessed_cache_dir` is used
+      only as the base for resolving `relative_npz_path` — the *split*
+      contents come from the manifest, not from the train/val subdir names.
+      `split_train` / `split_val` name which manifest partitions become the
+      returned train and val loaders. Requires `preprocessed_cache_dir`.
     """
-    if preprocessed_cache_dir:
+    if split_manifest:
+        # Manifest-driven path. Delegates enumeration to training/split_manifest
+        # so callers don't need to import from that module directly.
+        if not preprocessed_cache_dir:
+            raise ValueError("split_manifest requires preprocessed_cache_dir "
+                             "(used as the base for relative_npz_path resolution).")
+        from training.split_manifest import load_manifest
+
+        train_cases = load_manifest(split_manifest, split=split_train,
+                                    cache_root=preprocessed_cache_dir)
+        val_cases   = load_manifest(split_manifest, split=split_val,
+                                    cache_root=preprocessed_cache_dir)
+        if max_cases is not None:
+            train_cases = train_cases[:max_cases]
+            val_cases   = val_cases[:max_cases]
+        print(f"Manifest {os.path.basename(split_manifest)!r}: "
+              f"train ({split_train})={len(train_cases)}  "
+              f"val ({split_val})={len(val_cases)}")
+        # Each case already carries an absolute npz_path — the cache_dir arg
+        # to PreprocessedDataset becomes the fallback only. Passing the
+        # preprocessed_cache_dir here means legacy behavior would still work
+        # if `npz_path` were ever missing from a case (it isn't).
+        train_ds = PreprocessedDataset(preprocessed_cache_dir, train_cases,
+                                       is_train=True,  patch_size=patch_size)
+        val_ds   = PreprocessedDataset(preprocessed_cache_dir, val_cases,
+                                       is_train=False, patch_size=patch_size)
+    elif preprocessed_cache_dir:
         # Cache path: list patient_ids from .npz files — raw NIfTI dataset not needed.
         train_cache = os.path.join(preprocessed_cache_dir, "train")
         val_cache   = os.path.join(preprocessed_cache_dir, "val")
