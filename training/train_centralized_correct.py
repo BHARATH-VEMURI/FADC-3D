@@ -62,8 +62,34 @@ from models.unet_3d_fadc_correct import (
     build_unet3d_fadc_correct, MODEL_NAMES, EXPECTED_ADAPTIVE_CONV_COUNT,
     UNet3DFADCCorrect,
 )
+from models.unet_3d_fadc_continuous import (
+    build_unet3d_fadc_continuous,
+    MODEL_NAMES as CONTINUOUS_MODEL_NAMES,
+    EXPECTED_ADAPTIVE_BLOCK_COUNT as CONTINUOUS_EXPECTED_ADAPTIVE_BLOCK_COUNT,
+)
 from fadc_3d_correct.adaptive_dilated_conv_3d import AdaptiveDilatedConv3D
+from fadc_3d_continuous import CONTINUOUS_ADADR3D_META
 from training.losses import DiceCELoss
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# MODEL-KIND DISPATCH
+#
+# The trainer natively handles both the discrete package
+# (`models/unet_3d_fadc_correct.py`) and the continuous package
+# (`models/unet_3d_fadc_continuous.py`). Checkpoints carry `arch_kind`
+# so a strict resume cannot cross the two implementations.
+# ═══════════════════════════════════════════════════════════════════════
+
+ALL_MODEL_NAMES = tuple(list(MODEL_NAMES) + list(CONTINUOUS_MODEL_NAMES))
+
+
+def _model_kind(model_name: str) -> str:
+    if model_name in CONTINUOUS_MODEL_NAMES:
+        return "continuous"
+    if model_name in MODEL_NAMES:
+        return "discrete"
+    raise ValueError(f"Unknown model {model_name!r}; expected one of {ALL_MODEL_NAMES}")
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -98,7 +124,7 @@ def parse_args():
     p.add_argument("--smoke_test", action="store_true",
                    help="2 epochs on 4 cases — verifies the end-to-end pipeline.")
     p.add_argument("--model", type=str, default="unet3d_fadc_encoder_correct",
-                   choices=list(MODEL_NAMES))
+                   choices=list(ALL_MODEL_NAMES))
     p.add_argument("--patch_size", type=int, nargs=3, default=None,
                    metavar=("X", "Y", "Z"))
     p.add_argument("--warmup_epochs", type=int, default=5)
@@ -291,21 +317,32 @@ def load_config(config_path: str, args) -> dict:
 # ARCHITECTURE-IDENTITY GUARD
 # ═══════════════════════════════════════════════════════════════════════
 
-def _arch_identity(model_name: str, model_cfg: dict, extras: dict) -> dict:
+def _arch_identity(model_name: str, model_cfg: dict, extras: dict,
+                   arch_kind: str = "discrete") -> dict:
     """Small dict recording the architecture identity of a checkpoint.
 
     Deliberately excludes patch_size and validation settings: those do NOT
     change parameter shapes, so a strict-load can safely restore weights
     regardless.
+
+    `arch_kind` is the discrete-vs-continuous discriminator. Ckpts written
+    before this field existed are all discrete, so a missing value on the
+    ckpt side is treated as "discrete" for backward-compat.
     """
-    return {
+    ident = {
         "model_name": model_name,
         "in_channels": int(model_cfg["in_channels"]),
         "out_channels": int(model_cfg["out_channels"]),
         "base_filters": int(model_cfg["base_filters"]),
         "deep_supervision": bool(model_cfg.get("deep_supervision", False)),
-        "fadc_correct": dict(extras),
+        "arch_kind": str(arch_kind),
     }
+    if arch_kind == "continuous":
+        ident["fadc_continuous"] = {k: v for k, v in CONTINUOUS_ADADR3D_META.items()}
+        ident["fadc_correct"] = {}
+    else:
+        ident["fadc_correct"] = dict(extras)
+    return ident
 
 
 def _require_matching_arch(ckpt: dict, current: dict) -> None:
@@ -321,23 +358,42 @@ def _require_matching_arch(ckpt: dict, current: dict) -> None:
                 f"Refusing to resume: architecture mismatch on '{key}': "
                 f"ckpt={ckpt_arch.get(key)}  current={current.get(key)}"
             )
-    ckpt_fc = ckpt_arch.get("fadc_correct", {})
-    cur_fc = current.get("fadc_correct", {})
-    if ckpt_fc.get("use_position_att", False) != cur_fc.get("use_position_att", False):
+    # arch_kind: discrete vs continuous. Legacy ckpts predate this field —
+    # they are all discrete, so a missing value is normalised.
+    ckpt_kind = ckpt_arch.get("arch_kind", "discrete")
+    cur_kind = current.get("arch_kind", "discrete")
+    if ckpt_kind != cur_kind:
         raise RuntimeError(
-            f"Refusing to resume: use_position_att mismatch (ckpt={ckpt_fc.get('use_position_att')} "
-            f"vs current={cur_fc.get('use_position_att')})"
+            f"Refusing to resume: arch_kind mismatch (ckpt={ckpt_kind!r} "
+            f"vs current={cur_kind!r}). Discrete and continuous FADC3D "
+            f"share model names but not parameter shapes."
         )
+    # Only check use_position_att for the discrete arch — continuous has no
+    # such knob.
+    if cur_kind == "discrete":
+        ckpt_fc = ckpt_arch.get("fadc_correct", {}) or {}
+        cur_fc = current.get("fadc_correct", {}) or {}
+        if ckpt_fc.get("use_position_att", False) != cur_fc.get("use_position_att", False):
+            raise RuntimeError(
+                f"Refusing to resume: use_position_att mismatch (ckpt={ckpt_fc.get('use_position_att')} "
+                f"vs current={cur_fc.get('use_position_att')})"
+            )
 
 
 def _require_matching_split(ckpt: dict, current: dict) -> None:
     """Refuse to resume across a manifest change.
 
     Compares (split_manifest_sha256, split_partition_train, split_partition_val,
-    split_seed) on the checkpoint against the current run. A checkpoint that
-    trained on no manifest cannot be resumed under a manifest, and vice versa.
-    Purely additive — legacy resumes that predate the manifest field skip
-    silently because both sides carry None.
+    split_seed, split_kind) on the checkpoint against the current run. A
+    checkpoint that trained on no manifest cannot be resumed under a manifest,
+    and vice versa. Purely additive — legacy resumes that predate the manifest
+    field skip silently because both sides carry None.
+
+    `split_kind` is the discriminator between the historical seed-42 70/10/20
+    manifests (kind='seed_split' or None on legacy) and the default-cache
+    snapshot (kind='default_cache'). A 70/10/20 checkpoint cannot be
+    resumed under a default-cache run — the training set differs by ~150
+    patients and validation Dice would be measured on a leaked-in cohort.
     """
     ckpt_split = ckpt.get("split_identity", {}) or {}
     cur_split = current or {}
@@ -345,7 +401,7 @@ def _require_matching_split(ckpt: dict, current: dict) -> None:
     if not any(ckpt_split.values()) and not any(cur_split.values()):
         return
     for key in ("split_manifest_sha256", "split_partition_train",
-                "split_partition_val", "split_seed"):
+                "split_partition_val", "split_seed", "split_kind"):
         if ckpt_split.get(key) != cur_split.get(key):
             raise RuntimeError(
                 f"Refusing to resume: split identity mismatch on '{key}': "
@@ -354,7 +410,14 @@ def _require_matching_split(ckpt: dict, current: dict) -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# MECHANISM STATS (unchanged)
+# MECHANISM STATS — kind-aware
+#
+# Discrete FADC has voxelwise k_att over three dilation branches (D=1,2,3)
+# and channel/filter low/high attention batch-stds. Continuous FADC has
+# per-voxel effective dilation D(p) = 1 + s(p) and a per-position mask
+# m(p, q) for q in {-1,0,1}^3. Different mechanisms, different summaries.
+# The trainer dispatches on model kind and never prints NaNs for the
+# other side's stats.
 # ═══════════════════════════════════════════════════════════════════════
 
 @torch.no_grad()
@@ -397,6 +460,85 @@ def snapshot_mechanism_stats(model: UNet3DFADCCorrect) -> dict:
         "c_high_batch_std":       _stat(c_high_std),
         "f_high_batch_std":       _stat(f_high_std),
     }
+
+
+@torch.no_grad()
+def snapshot_continuous_mechanism_stats(model: nn.Module) -> dict:
+    """Continuous-FADC mechanism snapshot.
+
+    Iterates every `ContinuousDilatedConv3D` in the model and folds their
+    per-voxel `last_effective_dilation` and per-voxel per-position `last_mask`
+    caches into scalar summaries. Values are averaged across modules so a
+    single dict describes the whole encoder.
+
+    Returned keys (all floats):
+        eff_dilation_mean   : mean of (1 + s(p)) across every voxel/module
+        eff_dilation_std    : std across voxels within a module, averaged over modules
+        eff_dilation_min    : min effective dilation observed
+        eff_dilation_max    : max effective dilation observed
+        mask_mean           : mean of sigmoid mask values in [0, 1]
+        mask_std            : std of mask values (voxelwise across positions)
+        mask_frac_near_half : fraction of mask values within |m - 0.5| < 0.05
+                              (unmoved-from-init proxy)
+    """
+    from fadc_3d_continuous.continuous_dilated_conv_3d import ContinuousDilatedConv3D
+
+    means, stds, mins, maxs = [], [], [], []
+    m_means, m_stds, m_frac05 = [], [], []
+    for module in model.modules():
+        if not isinstance(module, ContinuousDilatedConv3D):
+            continue
+        ed = module.adadr.last_effective_dilation
+        mk = module.adadr.last_mask
+        if ed is None or mk is None:
+            continue
+        ed_f = ed.detach().float()
+        means.append(ed_f.mean().item())
+        # std per module — measured within the (B, D, H, W) tensor for that module.
+        stds.append(ed_f.std().item() if ed_f.numel() > 1 else 0.0)
+        mins.append(ed_f.min().item())
+        maxs.append(ed_f.max().item())
+
+        mk_f = mk.detach().float()
+        m_means.append(mk_f.mean().item())
+        m_stds.append(mk_f.std().item() if mk_f.numel() > 1 else 0.0)
+        near_half = ((mk_f - 0.5).abs() < 0.05).float().mean().item()
+        m_frac05.append(near_half)
+
+    def _stat(xs, agg=float("nan")):
+        return float(np.mean(xs)) if xs else float(agg)
+
+    return {
+        "eff_dilation_mean":   _stat(means),
+        "eff_dilation_std":    _stat(stds),
+        "eff_dilation_min":    _stat(mins),
+        "eff_dilation_max":    _stat(maxs),
+        "mask_mean":           _stat(m_means),
+        "mask_std":            _stat(m_stds),
+        "mask_frac_near_half": _stat(m_frac05),
+    }
+
+
+def _format_mech_line(kind: str, stats: dict) -> str:
+    """Compact one-line mechanism summary for the per-epoch printout.
+
+    Discrete: E[dil]=<...>  (matches historical format).
+    Continuous: <D>=<...> mask_mu=<...> — no E[dil]=NaN clutter.
+    Returns an empty string if the stats dict is empty (all NaN)."""
+    if kind == "continuous":
+        m = stats.get("eff_dilation_mean")
+        s = stats.get("eff_dilation_std")
+        mm = stats.get("mask_mean")
+        if m is None or (isinstance(m, float) and (m != m)):   # NaN check
+            return ""
+        return (f"<D>={m:.3f}±{s:.3f} "
+                f"[{stats['eff_dilation_min']:.2f},{stats['eff_dilation_max']:.2f}] "
+                f"mask_mu={mm:.3f}")
+    else:
+        m = stats.get("expected_dilation_mean")
+        if m is None or (isinstance(m, float) and (m != m)):
+            return ""
+        return f"E[dil]={m:.3f}"
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -533,25 +675,48 @@ def train(cfg, args):
         out_channels=cfg["model"]["out_channels"],
         base_filters=cfg["model"]["base_filters"],
     )
-    adakern_cfg = dict(use_position_att=bool(args.use_position_att))
-    model = build_unet3d_fadc_correct(
-        model_name=args.model,
-        **model_kwargs,
-        deep_supervision=args.deep_supervision,
-        adakern_cfg=adakern_cfg,
-    ).to(device)
+    kind = _model_kind(args.model)
+    if kind == "continuous":
+        if args.deep_supervision:
+            raise SystemExit(
+                "--deep_supervision is incompatible with the continuous FADC3D "
+                "encoder (contract: DS off — see models/unet_3d_fadc_continuous.py)."
+            )
+        model = build_unet3d_fadc_continuous(
+            model_name=args.model,
+            **model_kwargs,
+            deep_supervision=False,
+        ).to(device)
+        n_adapt = model.count_adaptive_blocks()
+        expected = CONTINUOUS_EXPECTED_ADAPTIVE_BLOCK_COUNT["encoder"]
+        if n_adapt != expected:
+            raise RuntimeError(
+                f"Model {args.model} has {n_adapt} continuous adaptive blocks, expected {expected}."
+            )
+        print(f"Model: {args.model}  (continuous encoder)  adaptive_blocks={n_adapt}/{expected}")
+    else:
+        adakern_cfg = dict(use_position_att=bool(args.use_position_att))
+        model = build_unet3d_fadc_correct(
+            model_name=args.model,
+            **model_kwargs,
+            deep_supervision=args.deep_supervision,
+            adakern_cfg=adakern_cfg,
+        ).to(device)
+        placement = args.model.split("_")[2]
+        n_adapt = model.count_adaptive_convs()
+        expected = EXPECTED_ADAPTIVE_CONV_COUNT[placement]
+        if n_adapt != expected:
+            raise RuntimeError(
+                f"Model {args.model} has {n_adapt} corrected adaptive convs, expected {expected}."
+            )
+        print(f"Model: {args.model}  ({placement})  adaptive_convs={n_adapt}/{expected}")
 
-    placement = args.model.split("_")[2]
-    n_adapt = model.count_adaptive_convs()
-    expected = EXPECTED_ADAPTIVE_CONV_COUNT[placement]
-    if n_adapt != expected:
-        raise RuntimeError(
-            f"Model {args.model} has {n_adapt} corrected adaptive convs, expected {expected}."
-        )
-    print(f"Model: {args.model}  ({placement})  adaptive_convs={n_adapt}/{expected}")
     print(f"Params: {sum(p.numel() for p in model.parameters()):,}")
-    print(f"k_att temperature schedule: {args.k_att_temp_start} -> {args.k_att_temp_end} "
-          f"over {args.k_att_anneal_epochs} epochs")
+    _t_msg = (f"k_att temperature schedule: {args.k_att_temp_start} -> "
+              f"{args.k_att_temp_end} over {args.k_att_anneal_epochs} epochs")
+    if kind == "continuous":
+        _t_msg += "  (inert — continuous model has no k_att temperature)"
+    print(_t_msg)
 
     criterion = DiceCELoss(
         dice_weight=cfg["training"]["dice_weight"],
@@ -583,13 +748,13 @@ def train(cfg, args):
     train_log: list = []
 
     fadc_extras = {"use_position_att": bool(args.use_position_att)}
-    arch_id = _arch_identity(args.model, cfg["model"], fadc_extras)
+    arch_id = _arch_identity(args.model, cfg["model"], fadc_extras, arch_kind=kind)
 
     # Manifest identity: burn the CSV SHA256, split partitions and (if we
-    # can derive it) ratios/seed into every checkpoint. Downstream resumes
-    # and final-test evaluators refuse mismatched manifests. All fields
-    # None-safe when no manifest is used, so legacy training paths are
-    # unaffected.
+    # can derive it) ratios/seed/kind into every checkpoint. Downstream
+    # resumes and final-test evaluators refuse mismatched manifests. All
+    # fields None-safe when no manifest is used, so legacy training paths
+    # are unaffected.
     split_identity: dict = {
         "split_manifest_path":   os.path.abspath(split_manifest_arg) if split_manifest_arg else None,
         "split_manifest_sha256": None,
@@ -597,6 +762,7 @@ def train(cfg, args):
         "split_partition_val":   args.split_partition_val if split_manifest_arg else None,
         "split_seed":            None,
         "split_ratios":          None,
+        "split_kind":            None,   # 'default_cache' | 'seed_split' | None (legacy)
     }
     if split_manifest_arg:
         from training.split_manifest import manifest_sha256
@@ -610,6 +776,12 @@ def train(cfg, args):
                     _meta = json.load(_f)
                 split_identity["split_seed"]   = _meta.get("seed")
                 split_identity["split_ratios"] = _meta.get("ratios")
+                # split_kind is present on default-cache snapshots and any
+                # future manifest dialects. Historical seed-42 metadata files
+                # do not include it — normalise those to 'seed_split' so a
+                # default-cache resume vs seed-split resume is rejected by
+                # _require_matching_split.
+                split_identity["split_kind"] = _meta.get("split_kind") or "seed_split"
             except Exception:
                 pass  # metadata is a convenience; the checksum is authoritative.
     print(f"split_identity : {split_identity}")
@@ -681,9 +853,12 @@ def train(cfg, args):
     # ──────────────── training loop
     for epoch in range(start_epoch, epochs):
         # k_att temperature — set BEFORE training for this epoch.
+        # Continuous model has no k_att branch; the schedule is logged but
+        # not applied.
         t = k_att_temperature(epoch, args.k_att_anneal_epochs,
                               args.k_att_temp_start, args.k_att_temp_end)
-        model.set_temperature(t)
+        if hasattr(model, "set_temperature"):
+            model.set_temperature(t)
 
         model.train()
         epoch_loss = epoch_dice = epoch_ce = 0.0
@@ -725,7 +900,10 @@ def train(cfg, args):
             epoch_ce   += ce_loss.item()
             num_batches += 1
 
-        last_stats = snapshot_mechanism_stats(model)
+        if kind == "continuous":
+            last_stats = snapshot_continuous_mechanism_stats(model)
+        else:
+            last_stats = snapshot_mechanism_stats(model)
         pbar.close()
         scheduler.step()
 
@@ -735,10 +913,14 @@ def train(cfg, args):
         elapsed  = time.time() - t0
         lr_now   = scheduler.get_last_lr()[0]
         mins, secs = divmod(int(elapsed), 60)
-        print(f"Epoch {epoch+1:03d}/{epochs} | T={t:.2f} | "
+        mech_line = _format_mech_line(kind, last_stats)
+        # Continuous has no k_att temperature — drop the 'T=' segment in
+        # the epoch line to avoid a meaningless value.
+        _t_seg = f" T={t:.2f} |" if kind != "continuous" else ""
+        _mech_seg = f" {mech_line} |" if mech_line else ""
+        print(f"Epoch {epoch+1:03d}/{epochs} |{_t_seg} "
               f"Loss {avg_loss:.4f} | Dice {avg_dice:.4f} | CE {avg_ce:.4f} | "
-              f"LR {lr_now:.2e} | E[dil]={last_stats['expected_dilation_mean']:.3f} | "
-              f"{mins}m{secs}s")
+              f"LR {lr_now:.2e} |{_mech_seg} {mins}m{secs}s")
 
         log_entry = {
             "epoch": epoch + 1,
