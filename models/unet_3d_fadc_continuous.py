@@ -120,6 +120,8 @@ class UpBlock(nn.Module):
 
     def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
         x = self.up(x)
+        if x.shape[2:] != skip.shape[2:]:
+            x = F.interpolate(x, size=skip.shape[2:], mode="trilinear", align_corners=False)
         x = torch.cat([x, skip], dim=1)
         return self.conv(x)
 
