@@ -640,7 +640,34 @@ def atomic_json_write(obj, dest: os.PathLike) -> None:
 # TRAIN
 # ═══════════════════════════════════════════════════════════════════════
 
+def _validate_grad_accum_steps(raw) -> int:
+    """Fail-fast validator for --grad_accum_steps. Called at the very top
+    of train() so an invalid value cannot silently pass loader construction
+    and only surface deep inside the training loop.
+    """
+    if raw is None:
+        raw = 1
+    try:
+        v = int(raw)
+    except (TypeError, ValueError):
+        raise SystemExit(
+            f"--grad_accum_steps must be an integer >= 1 (got {raw!r})"
+        )
+    if v < 1:
+        raise SystemExit(
+            f"--grad_accum_steps must be >= 1 (got {v}). A zero or negative "
+            "value would produce a division-by-zero on the loss/step or a "
+            "negative-magnitude update; refusing to run."
+        )
+    return v
+
+
 def train(cfg, args):
+    # Fail-fast on --grad_accum_steps BEFORE any I/O (loader construction,
+    # dataset scan, model build). Repeat the validation later when the
+    # local variable is initialised — this early call is purely a guard.
+    _validate_grad_accum_steps(getattr(args, "grad_accum_steps", 1))
+
     if args.seed is not None:
         torch.manual_seed(args.seed)
         torch.cuda.manual_seed_all(args.seed)
@@ -798,10 +825,13 @@ def train(cfg, args):
     arch_id = _arch_identity(args.model, cfg["model"], fadc_extras, arch_kind=kind)
 
     # Training-run identity. Legacy defaults keep every prior discrete run's
-    # ckpt loadable: --grad_accum_steps defaults to 1, so physical == effective.
-    grad_accum_steps = max(1, int(getattr(args, "grad_accum_steps", 1) or 1))
-    if grad_accum_steps < 1:
-        raise SystemExit(f"--grad_accum_steps must be >= 1 (got {grad_accum_steps})")
+    # ckpt loadable: --grad_accum_steps defaults to 1, so physical ==
+    # effective. Strict validation happens once at the top of train() via
+    # _validate_grad_accum_steps; this re-call is a single source of truth
+    # for the local variable.
+    grad_accum_steps = _validate_grad_accum_steps(
+        getattr(args, "grad_accum_steps", 1)
+    )
     physical_batch_size = int(batch_size)
     effective_batch_size = physical_batch_size * grad_accum_steps
     train_id = {
@@ -989,12 +1019,23 @@ def train(cfg, args):
             num_batches += 1
 
         # Final partial accumulation group — the loader emitted a count of
-        # microbatches that isn't a multiple of grad_accum_steps. Step with
-        # the gradients we have rather than discarding them. This keeps the
-        # scaler / scheduler / optimizer state consistent (they always see
-        # the same number of steps regardless of loader length parity).
+        # microbatches that isn't a multiple of grad_accum_steps. We divided
+        # each microbatch's loss by grad_accum_steps for backward, so the
+        # accumulated gradients over m < grad_accum_steps microbatches have
+        # magnitude (m / grad_accum_steps) * mean_grad instead of the
+        # mean_grad we want. Multiply the unscaled grads by
+        # (grad_accum_steps / m) BEFORE clipping so the resulting step is
+        # numerically equivalent to averaging exactly the m microbatches
+        # actually present. The order matters: unscale first (undoes AMP
+        # scaling), then rescale (undoes the /grad_accum_steps bias for a
+        # partial group), then clip, then step + update + zero_grad.
         if microbatches_in_group > 0:
             scaler.unscale_(optimizer)
+            if grad_accum_steps > 1 and microbatches_in_group < grad_accum_steps:
+                correction = grad_accum_steps / microbatches_in_group
+                for p in model.parameters():
+                    if p.grad is not None:
+                        p.grad.mul_(correction)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
