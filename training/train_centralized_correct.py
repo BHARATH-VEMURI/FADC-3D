@@ -155,6 +155,17 @@ def parse_args():
                    help="Extra periodic named-snapshot cadence "
                         "(last_checkpoint.pth is always saved every epoch regardless).")
 
+    # ---- Gradient accumulation ------------------------------------------
+    # Default 1 keeps every historical experiment (including all discrete
+    # notebooks) bit-for-bit identical: a single microbatch per optimizer
+    # step. Values >1 divide the loss by grad_accum_steps for backward,
+    # accumulate gradients across grad_accum_steps microbatches, then take
+    # one optimizer step. Effective batch = --batch_size * --grad_accum_steps.
+    p.add_argument("--grad_accum_steps", type=int, default=1,
+                   help="Number of microbatches whose gradients accumulate "
+                        "before one optimizer step. Default 1 preserves the "
+                        "legacy per-microbatch step behavior.")
+
     return p.parse_args()
 
 
@@ -378,6 +389,41 @@ def _require_matching_arch(ckpt: dict, current: dict) -> None:
             raise RuntimeError(
                 f"Refusing to resume: use_position_att mismatch (ckpt={ckpt_fc.get('use_position_att')} "
                 f"vs current={cur_fc.get('use_position_att')})"
+            )
+
+
+def _require_matching_train(ckpt: dict, current: dict) -> None:
+    """Refuse to resume across a change in the training-run identity.
+
+    A checkpoint carries the (physical_batch_size, grad_accum_steps,
+    effective_batch_size) triple under 'train_identity'. Resuming under
+    different values changes the optimisation trajectory, so we hard-fail
+    rather than silently continue. Legacy checkpoints (predating this
+    field) are treated as physical_batch_size=<their cfg batch> with
+    grad_accum_steps=1 so backward-compat is preserved.
+    """
+    ckpt_train = ckpt.get("train_identity")
+    if ckpt_train is None:
+        # Legacy path: infer from cfg.training.batch_size if available;
+        # accumulation is always 1 on legacy since the flag did not exist.
+        legacy_bs = int(
+            (ckpt.get("config") or {}).get("training", {}).get("batch_size", 0)
+        ) or None
+        ckpt_train = {
+            "physical_batch_size":  legacy_bs,
+            "grad_accum_steps":     1,
+            "effective_batch_size": legacy_bs,
+        }
+    for key in ("physical_batch_size", "grad_accum_steps", "effective_batch_size"):
+        cv = ckpt_train.get(key)
+        nv = (current or {}).get(key)
+        # Skip if either side is None (legacy or a run that didn't record it).
+        if cv is None or nv is None:
+            continue
+        if int(cv) != int(nv):
+            raise RuntimeError(
+                f"Refusing to resume: train identity mismatch on '{key}': "
+                f"ckpt={cv}  current={nv}"
             )
 
 
@@ -751,6 +797,26 @@ def train(cfg, args):
     fadc_extras = {"use_position_att": bool(args.use_position_att)}
     arch_id = _arch_identity(args.model, cfg["model"], fadc_extras, arch_kind=kind)
 
+    # Training-run identity. Legacy defaults keep every prior discrete run's
+    # ckpt loadable: --grad_accum_steps defaults to 1, so physical == effective.
+    grad_accum_steps = max(1, int(getattr(args, "grad_accum_steps", 1) or 1))
+    if grad_accum_steps < 1:
+        raise SystemExit(f"--grad_accum_steps must be >= 1 (got {grad_accum_steps})")
+    physical_batch_size = int(batch_size)
+    effective_batch_size = physical_batch_size * grad_accum_steps
+    train_id = {
+        "physical_batch_size":  physical_batch_size,
+        "grad_accum_steps":     grad_accum_steps,
+        "effective_batch_size": effective_batch_size,
+    }
+    # Mirror the same fields into cfg so any downstream serialisation
+    # (train_log, formal_val json) sees them too.
+    cfg["training"]["physical_batch_size"]  = physical_batch_size
+    cfg["training"]["grad_accum_steps"]     = grad_accum_steps
+    cfg["training"]["effective_batch_size"] = effective_batch_size
+    print(f"batch identity : physical={physical_batch_size} "
+          f"accum={grad_accum_steps} effective={effective_batch_size}")
+
     # Manifest identity: burn the CSV SHA256, split partitions and (if we
     # can derive it) ratios/seed/kind into every checkpoint. Downstream
     # resumes and final-test evaluators refuse mismatched manifests. All
@@ -792,6 +858,7 @@ def train(cfg, args):
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
         _require_matching_arch(ckpt, arch_id)
         _require_matching_split(ckpt, split_identity)
+        _require_matching_train(ckpt, train_id)
         restored = []
         model.load_state_dict(ckpt["model"], strict=True)
         restored.append("model (strict)")
@@ -847,6 +914,7 @@ def train(cfg, args):
             "model_name":     args.model,
             "arch_identity":  arch_id,
             "split_identity": dict(split_identity),
+            "train_identity": dict(train_id),
             "val_config":     val_config,
             "train_log":      list(train_log),
         }
@@ -870,6 +938,13 @@ def train(cfg, args):
                     leave=False, ncols=110, unit="batch", file=sys.stdout,
                     mininterval=1.0)
 
+        # Gradient accumulation state — reset at the start of each epoch.
+        # grad_accum_steps == 1 collapses this to the historical single-step
+        # path: zero_grad -> forward -> backward -> step -> zero_grad.
+        optimizer.zero_grad(set_to_none=True)
+        microbatches_in_group = 0
+        optimizer_steps_this_epoch = 0
+
         for batch in pbar:
             if isinstance(batch["image"], list):
                 imgs = [torch.from_numpy(x.copy()) if isinstance(x, np.ndarray) else x
@@ -882,7 +957,6 @@ def train(cfg, args):
                 images = batch["image"].to(device)
                 labels = batch["label"].to(device)
 
-            optimizer.zero_grad()
             with autocast("cuda", enabled=device.type == "cuda"):
                 preds = model(images)
                 if isinstance(preds, tuple):
@@ -890,16 +964,43 @@ def train(cfg, args):
                 else:
                     total_loss, dice_loss, ce_loss = criterion(preds, labels)
 
-            scaler.scale(total_loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            scaler.step(optimizer)
-            scaler.update()
+            # Divide ONLY for backward — the gradient accumulated across
+            # grad_accum_steps microbatches averages out to what a single
+            # bigger-batch backward would have produced. Logging below uses
+            # the UNSCALED loss so per-batch metrics stay comparable across
+            # runs with different accumulation values.
+            loss_for_backward = total_loss / grad_accum_steps if grad_accum_steps > 1 else total_loss
+            scaler.scale(loss_for_backward).backward()
+            microbatches_in_group += 1
+
+            # Optimizer step only at an accumulation boundary.
+            if microbatches_in_group == grad_accum_steps:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+                microbatches_in_group = 0
+                optimizer_steps_this_epoch += 1
 
             epoch_loss += total_loss.item()
             epoch_dice += dice_loss.item()
             epoch_ce   += ce_loss.item()
             num_batches += 1
+
+        # Final partial accumulation group — the loader emitted a count of
+        # microbatches that isn't a multiple of grad_accum_steps. Step with
+        # the gradients we have rather than discarding them. This keeps the
+        # scaler / scheduler / optimizer state consistent (they always see
+        # the same number of steps regardless of loader length parity).
+        if microbatches_in_group > 0:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+            microbatches_in_group = 0
+            optimizer_steps_this_epoch += 1
 
         if kind == "continuous":
             last_stats = snapshot_continuous_mechanism_stats(model)
