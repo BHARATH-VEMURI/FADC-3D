@@ -171,9 +171,13 @@ def main():
 
     # Patch size — prefer CLI override, else ckpt config.
     if args.patch_size is not None:
-        patch_size = tuple(args.patch_size)
+        _raw_patch = tuple(args.patch_size)
+        _patch_source = "--patch_size"
     else:
-        patch_size = tuple(cfg.get("data", {}).get("patch_size", [128, 128, 64]))
+        _raw_patch = tuple(cfg.get("data", {}).get("patch_size", [128, 128, 64]))
+        _patch_source = "checkpoint cfg[\"data\"][\"patch_size\"]"
+    from training.patch_validation import validate_patch_size as _vps
+    patch_size = _vps(_raw_patch, name=f"sliding-window patch_size (source={_patch_source})")
     print(f"patch_size   : {patch_size}")
     print(f"overlap      : {args.overlap}   sw_batch_size : {args.sw_batch_size}")
 

@@ -70,6 +70,7 @@ from models.unet_3d_fadc_continuous import (
 from fadc_3d_correct.adaptive_dilated_conv_3d import AdaptiveDilatedConv3D
 from fadc_3d_continuous import CONTINUOUS_ADADR3D_META
 from training.losses import DiceCELoss
+from training.patch_validation import validate_patch_size
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -610,7 +611,7 @@ def train(cfg, args):
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    patch_size = tuple(cfg["data"]["patch_size"])
+    patch_size = validate_patch_size(cfg["data"]["patch_size"], name="patch_size")
     epochs = cfg["training"]["epochs"]
     lr = cfg["training"]["lr"]
     batch_size = cfg["training"]["batch_size"]
