@@ -311,3 +311,178 @@ def generate_and_write(cache_root: str,
     meta = write_metadata(assigned, seed=seed, ratios=ratios,
                           csv_path=csv_path, meta_path=meta_path)
     return meta
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# DEFAULT-CACHE SNAPSHOT (no random reassignment)
+#
+# The uploaded preprocessed cache already carries a fixed partition:
+#     <cache_root>/train/*.npz  ->  1200 patients
+#     <cache_root>/val/*.npz    ->  306  patients
+# and NO test partition. This section serialises that exact membership as
+# a read-only snapshot manifest without touching any RNG. The split for
+# every patient is copied verbatim from its physical subdir; test rows
+# are never emitted.
+# ─────────────────────────────────────────────────────────────────────────
+
+DEFAULT_SPLIT_KIND = "default_cache"
+DEFAULT_EXPECTED_TRAIN = 1200
+DEFAULT_EXPECTED_VAL = 306
+
+
+def enumerate_default_partition(cache_root: str) -> list[dict]:
+    """Return one row per patient with `split` fixed to its physical
+    subdir ('train' or 'val'). Never emits 'test' rows. No randomness.
+
+    Raises RuntimeError on the same duplicate-across-subdirs condition as
+    `enumerate_patients` — one patient in both physical dirs is a broken
+    cache and would silently double-count.
+    """
+    patients = enumerate_patients(cache_root)
+    assigned: list[dict] = []
+    for c in patients:
+        sub = c["source_subdir"]
+        if sub not in ("train", "val"):
+            raise RuntimeError(
+                f"enumerate_default_partition: unexpected source_subdir "
+                f"{sub!r} for patient {c['patient_id']!r} — the default "
+                f"cache only contains train/ and val/."
+            )
+        row = dict(c); row["split"] = sub
+        assigned.append(row)
+    assigned.sort(key=lambda c: c["patient_id"])
+    return assigned
+
+
+def write_default_metadata(assigned: list[dict],
+                           csv_path: str,
+                           meta_path: str,
+                           expected_train: int,
+                           expected_val: int) -> dict:
+    """Write the metadata JSON for a default-cache snapshot.
+
+    Fields deliberately parallel `write_metadata` so downstream consumers
+    (checkpoint split_identity readers, evaluator preflight) can treat both
+    metadata dialects uniformly. Split_kind is set to 'default_cache' and
+    the seed field is None — the partition is defined by physical subdirs,
+    not by an RNG.
+    """
+    meta_path = str(meta_path)
+    os.makedirs(os.path.dirname(meta_path) or ".", exist_ok=True)
+
+    by_split = Counter(c["split"] for c in assigned)
+    per_collection_split: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    for c in assigned:
+        per_collection_split[c["collection"]][c["split"]] += 1
+
+    meta = {
+        "split_kind":           DEFAULT_SPLIT_KIND,
+        "seed":                 None,
+        "ratios":               None,
+        "n_patients_total":     int(len(assigned)),
+        "n_per_split":          {"train": int(by_split["train"]),
+                                 "val":   int(by_split["val"]),
+                                 "test":  0},
+        "n_per_collection_split": {coll: {"train": int(per_collection_split[coll].get("train", 0)),
+                                          "val":   int(per_collection_split[coll].get("val", 0)),
+                                          "test":  0}
+                                   for coll in COLLECTIONS},
+        "expected_train":       int(expected_train),
+        "expected_val":         int(expected_val),
+        "csv_path":             os.path.abspath(csv_path),
+        "csv_sha256":           manifest_sha256(csv_path),
+    }
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2, sort_keys=True)
+    return meta
+
+
+def generate_default_snapshot(cache_root: str,
+                              csv_path: str,
+                              meta_path: str,
+                              expected_train: int = DEFAULT_EXPECTED_TRAIN,
+                              expected_val: int = DEFAULT_EXPECTED_VAL,
+                              ) -> dict:
+    """One-shot: enumerate the physical cache subdirs, assert the expected
+    counts (default 1200/306), write CSV + JSON, return metadata.
+
+    Fails immediately if any of these hold:
+      - the cache does not contain exactly `expected_train` train patients;
+      - the cache does not contain exactly `expected_val` val patients;
+      - a patient appears in both physical subdirs;
+      - any 'test' row would be produced (structural — enumerate_default_partition
+        never emits one, so this is defence-in-depth).
+    """
+    assigned = enumerate_default_partition(cache_root)
+
+    # Pre-flight the counts before writing anything — a mis-count means
+    # the mounted dataset is wrong, and we do not want a stale manifest
+    # sitting next to the run's outputs.
+    n_train = sum(1 for c in assigned if c["split"] == "train")
+    n_val   = sum(1 for c in assigned if c["split"] == "val")
+    n_test  = sum(1 for c in assigned if c["split"] == "test")
+
+    if n_test != 0:
+        raise RuntimeError(
+            f"generate_default_snapshot: refusing — {n_test} 'test' rows "
+            f"would be emitted; the default cache has no test partition."
+        )
+    if n_train != expected_train:
+        raise RuntimeError(
+            f"generate_default_snapshot: refusing — found {n_train} train "
+            f"patients, expected exactly {expected_train}. The mounted "
+            f"cache does not match the default 1200/306 contract."
+        )
+    if n_val != expected_val:
+        raise RuntimeError(
+            f"generate_default_snapshot: refusing — found {n_val} val "
+            f"patients, expected exactly {expected_val}. The mounted "
+            f"cache does not match the default 1200/306 contract."
+        )
+
+    # Zero overlap by construction (enumerate_patients dedups) — still
+    # re-assert here so a change to the enumeration semantics can never
+    # silently break the snapshot contract.
+    train_ids = {c["patient_id"] for c in assigned if c["split"] == "train"}
+    val_ids   = {c["patient_id"] for c in assigned if c["split"] == "val"}
+    if not train_ids.isdisjoint(val_ids):
+        overlap = sorted(train_ids & val_ids)[:5]
+        raise RuntimeError(
+            f"generate_default_snapshot: train/val overlap detected "
+            f"({len(train_ids & val_ids)} patients, first 5: {overlap})."
+        )
+    if len(train_ids) + len(val_ids) != len(assigned):
+        raise RuntimeError(
+            f"generate_default_snapshot: patient not counted exactly once "
+            f"(unique={len(train_ids) + len(val_ids)} vs rows={len(assigned)})."
+        )
+
+    write_manifest(assigned, csv_path)
+    meta = write_default_metadata(
+        assigned, csv_path=csv_path, meta_path=meta_path,
+        expected_train=expected_train, expected_val=expected_val,
+    )
+    return meta
+
+
+def verify_default_manifest_partitions(csv_path: str,
+                                       expected_train: int = DEFAULT_EXPECTED_TRAIN,
+                                       expected_val: int = DEFAULT_EXPECTED_VAL) -> dict:
+    """Cross-check a default-cache manifest: exact 1200 train, 306 val,
+    no test rows, every patient once, zero overlap. Returns the small
+    summary dict from `verify_manifest_partitions`.
+    """
+    summary = verify_manifest_partitions(csv_path)
+    if summary["n_test"] != 0:
+        raise AssertionError(
+            f"default manifest carries {summary['n_test']} test rows; expected 0."
+        )
+    if summary["n_train"] != expected_train:
+        raise AssertionError(
+            f"default manifest has {summary['n_train']} train rows; expected {expected_train}."
+        )
+    if summary["n_val"] != expected_val:
+        raise AssertionError(
+            f"default manifest has {summary['n_val']} val rows; expected {expected_val}."
+        )
+    return summary

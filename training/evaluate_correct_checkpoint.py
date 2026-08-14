@@ -40,11 +40,59 @@ from monai.transforms import AsDiscrete
 
 sys.path.append(str(Path(__file__).parent.parent))
 from data.mama_mia_dataset import build_centralized_loaders, DATA_ROOT
-from models.unet_3d_fadc_correct import build_unet3d_fadc_correct
+from models.unet_3d_fadc_correct import (
+    build_unet3d_fadc_correct, MODEL_NAMES as DISCRETE_MODEL_NAMES,
+)
+from models.unet_3d_fadc_continuous import (
+    build_unet3d_fadc_continuous, MODEL_NAMES as CONTINUOUS_MODEL_NAMES,
+)
 from training.train_centralized_correct import (
     make_primary_predictor,
     _iou_sens_per_case,
 )
+
+
+def _build_model_from_arch(arch: dict, device: torch.device) -> torch.nn.Module:
+    """Rebuild the exact model captured by `arch_identity`.
+
+    Dispatch on `arch_kind` — 'continuous' → continuous package,
+    everything else (including legacy ckpts with no arch_kind field) →
+    discrete package.
+    """
+    kind = arch.get("arch_kind", "discrete")
+    name = arch["model_name"]
+    in_ch = int(arch["in_channels"])
+    out_ch = int(arch["out_channels"])
+    base = int(arch["base_filters"])
+    ds = bool(arch["deep_supervision"])
+    if kind == "continuous":
+        if name not in CONTINUOUS_MODEL_NAMES:
+            raise SystemExit(
+                f"Refusing to evaluate: arch_kind=continuous but model_name "
+                f"{name!r} is not registered as a continuous model."
+            )
+        if ds:
+            raise SystemExit(
+                "Refusing to evaluate: continuous checkpoint has deep_supervision=True, "
+                "which the continuous encoder does not support."
+            )
+        return build_unet3d_fadc_continuous(
+            model_name=name, in_channels=in_ch, out_channels=out_ch,
+            base_filters=base, deep_supervision=False,
+        ).to(device).eval()
+    # discrete (legacy or explicit)
+    if name not in DISCRETE_MODEL_NAMES:
+        raise SystemExit(
+            f"Refusing to evaluate: arch_kind={kind!r} but model_name "
+            f"{name!r} is not registered as a discrete model."
+        )
+    adakern_cfg = {
+        "use_position_att": bool(arch.get("fadc_correct", {}).get("use_position_att", False))
+    }
+    return build_unet3d_fadc_correct(
+        model_name=name, in_channels=in_ch, out_channels=out_ch,
+        base_filters=base, deep_supervision=ds, adakern_cfg=adakern_cfg,
+    ).to(device).eval()
 
 
 def parse_args():
@@ -115,25 +163,21 @@ def main():
     print(f"arch_identity: {arch}")
     print(f"ckpt best_dice(formal, self-reported): {ckpt_best:.4f}")
 
-    # Rebuild the exact model.
-    adakern_cfg = {"use_position_att": bool(arch.get("fadc_correct", {}).get("use_position_att", False))}
-    model = build_unet3d_fadc_correct(
-        model_name=model_name,
-        in_channels=int(arch["in_channels"]),
-        out_channels=int(arch["out_channels"]),
-        base_filters=int(arch["base_filters"]),
-        deep_supervision=bool(arch["deep_supervision"]),
-        adakern_cfg=adakern_cfg,
-    ).to(device).eval()
+    # Rebuild the exact model (discrete or continuous).
+    model = _build_model_from_arch(arch, device)
     missing, unexpected = model.load_state_dict(ckpt["model"], strict=True)
     if missing or unexpected:
         raise SystemExit(f"strict load failed: missing={missing} unexpected={unexpected}")
 
     # Patch size — prefer CLI override, else ckpt config.
     if args.patch_size is not None:
-        patch_size = tuple(args.patch_size)
+        _raw_patch = tuple(args.patch_size)
+        _patch_source = "--patch_size"
     else:
-        patch_size = tuple(cfg.get("data", {}).get("patch_size", [128, 128, 64]))
+        _raw_patch = tuple(cfg.get("data", {}).get("patch_size", [128, 128, 64]))
+        _patch_source = "checkpoint cfg[\"data\"][\"patch_size\"]"
+    from training.patch_validation import validate_patch_size as _vps
+    patch_size = _vps(_raw_patch, name=f"sliding-window patch_size (source={_patch_source})")
     print(f"patch_size   : {patch_size}")
     print(f"overlap      : {args.overlap}   sw_batch_size : {args.sw_batch_size}")
 
