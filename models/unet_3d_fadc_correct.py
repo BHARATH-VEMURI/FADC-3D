@@ -141,12 +141,15 @@ class UpBlock(nn.Module):
 # ------------------------------------------------------------------ model
 
 
-_PLACEMENTS = ("encoder", "decoder", "bottleneck", "full")
+_PLACEMENTS = ("encoder", "decoder", "bottleneck", "encdec", "full")
 
 _MODEL_NAME_TO_PLACEMENT = {
     "unet3d_fadc_encoder_correct":    "encoder",
     "unet3d_fadc_decoder_correct":    "decoder",
     "unet3d_fadc_bottleneck_correct": "bottleneck",
+    # encdec = FADC on every encoder and decoder DownBlock/UpBlock, NOT on
+    # the bottleneck. Complementary to the bottleneck-only placement.
+    "unet3d_fadc_encdec_correct":     "encdec",
     "unet3d_fadc_full_correct":       "full",
 }
 
@@ -186,9 +189,9 @@ class UNet3DFADCCorrect(nn.Module):
         self.out_channels = int(out_channels)
         self.base_filters = int(base_filters)
 
-        enc_fadc = fadc_placement in ("encoder", "full")
-        bn_fadc = fadc_placement in ("bottleneck", "full")
-        dec_fadc = fadc_placement in ("decoder", "full")
+        enc_fadc = fadc_placement in ("encoder", "encdec", "full")
+        bn_fadc  = fadc_placement in ("bottleneck", "full")
+        dec_fadc = fadc_placement in ("decoder", "encdec", "full")
 
         f = base_filters
 
@@ -282,5 +285,6 @@ EXPECTED_ADAPTIVE_CONV_COUNT = {
     "encoder":    8,
     "decoder":    8,
     "bottleneck": 2,
+    "encdec":     16,   # 8 encoder + 8 decoder, no bottleneck
     "full":       18,
 }

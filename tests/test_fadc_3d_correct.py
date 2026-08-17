@@ -24,6 +24,7 @@ Coverage (23 assertions per spec):
   21 Bottleneck placement -> 2.
   22 Full placement -> 18.
   23 No corrected FADC modules outside the requested placement.
+  24 Encoder+decoder placement (encdec, no bottleneck) -> 16.
 
 Run:
     conda activate fadc3d
@@ -411,7 +412,7 @@ def test_19_20_21_22_23_placements():
         expected = EXPECTED_ADAPTIVE_CONV_COUNT[placement]
         n = m.count_adaptive_convs()
         check(n == expected,
-              f"{ {'encoder':19,'decoder':20,'bottleneck':21,'full':22}[placement] }_placement_{placement}_count",
+              f"{ {'encoder':19,'decoder':20,'bottleneck':21,'encdec':24,'full':22}[placement] }_placement_{placement}_count",
               f"{name} -> {n}/{expected}",
               f"{name} has {n} adaptive convs, expected {expected}")
         adapt_names = m.adaptive_conv_names()
@@ -419,6 +420,7 @@ def test_19_20_21_22_23_placements():
             "encoder":    ("enc",),
             "decoder":    ("dec",),
             "bottleneck": ("bottleneck",),
+            "encdec":     ("enc", "dec"),
             "full":       ("enc", "bottleneck", "dec"),
         }[placement]
         outside = [n_ for n_ in adapt_names if not any(n_.startswith(pref) for pref in allowed_prefixes)]
